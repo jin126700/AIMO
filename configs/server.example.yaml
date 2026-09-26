@@ -1,0 +1,55 @@
+# 서버 실행 예시. 개인 경로와 token은 이 파일에 넣지 않습니다.
+# 실제 값은 Git에서 제외되는 configs/server.yaml 로 복사해 채웁니다.
+run:
+  run_id: aimo_v1_run001
+  seed: 0
+  device: cuda          # 실제 실행에는 CLI의 --execute-gpu가 함께 필요합니다.
+  notes: "E1/E2 server run"
+
+paths:
+  input_root: /data1/HKM/data
+  output_root: /data1/HKM/result/AIMO/HKM/aimo_v1
+
+data:
+  source: pages
+  page_dir: /data1/HKM/result/AIMO/HKM/aimo_v1/pages
+  subset_fraction: 1.0
+  scale_floor: 1.0e-6
+
+model:
+  name: loop4
+  d_model: 128
+  n_heads: 4
+  ffn_dim: 256
+  dropout: 0.1
+  n_loops: 4
+  tied: true
+
+train:
+  microbatch_originals: 1
+  max_epochs: 100
+  patience: 15
+
+server:
+  repo_root: /data1/HKM/AIMO
+  input_root: /data1/HKM/data
+  output_root: /data1/HKM/result/AIMO/HKM/aimo_v1
+  model_id: Qwen/Qwen3-4B
+  tiny_config: false
+  gpu_block_minutes: 175    # 누적 GPU-active 175분 이상이면 새 작업 시작을 막습니다.
+  gpu_stop_minutes: 180     # 진행 중이어도 180분에서 협조적으로 종료합니다.
+  screening:
+    thinking: false
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    min_p: 0.0
+    max_new_tokens: 256
+    slots_per_prompt: 4
+  mathgap:
+    # SERVER_PENDING: 확인한 MathGAP revision과 dotted path만 채웁니다.
+    # 확인하지 못한 API는 비워 두고, adapter가 fail-fast하게 둡니다.
+    revision: SERVER_PENDING
+    generator_path: null
+    renderer_path: null
+    oracle_path: null

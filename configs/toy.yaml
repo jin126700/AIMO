@@ -1,0 +1,58 @@
+# E0: CPU synthetic end-to-end 검증 설정.
+# 실제 robust dataset이 아니라 leakage/rollout/reload 검증용 자료입니다.
+run:
+  run_id: e0_toy
+  seed: 0
+  device: cpu
+  notes: "E0 CPU synthetic verification"
+
+paths:
+  input_root: data
+  output_root: runs
+
+data:
+  source: synthetic
+  subset_fraction: 1.0
+  scale_floor: 1.0e-6
+  synthetic:
+    hidden_size: 32
+    n_blocks: 6
+    n_landmarks: 4
+    n_originals_train: 24
+    n_originals_validation: 8
+    n_originals_test: 8
+    variants_per_original: 3
+    identity_fraction: 0.1
+    invalid_landmark_prob: 0.15
+    noise_scale: 0.005
+    delta_scale: 5.0          # train/validation/known/unseen에 쓰는 variant delta 세기
+    harder_delta_scale: 11.0  # harder-test는 더 큰 perturbation
+
+model:
+  name: loop4          # primary: shared block 4회
+  d_model: 128
+  n_heads: 4
+  ffn_dim: 256
+  dropout: 0.1
+  n_loops: 4
+  tied: true
+  use_variant_prefix: true
+
+train:
+  lr: 3.0e-4
+  weight_decay: 1.0e-3
+  batch_originals: 8
+  microbatch_originals: 4
+  grad_clip: 1.0
+  max_epochs: 100
+  patience: 15
+  cuts_per_pair: 2
+  horizons: [2, 4]
+  w_next: 1.0
+  w_within: 1.0
+  w_roll: 0.25
+
+eval:
+  horizons: [2, 4]
+  bootstrap_samples: 200
+  support_swap: true

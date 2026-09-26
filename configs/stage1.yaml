@@ -1,0 +1,50 @@
+# Stage 1: screened-stable original-variant pair의 update 흐름 학습 (E2).
+# Page는 서버에서 추출한 npz directory에서 읽습니다. shape는 자료가 결정합니다.
+run:
+  run_id: stage1_v1
+  seed: 0
+  device: cpu          # 실제 GPU 실행은 CLI의 --execute-gpu가 필요합니다.
+  notes: "Stage 1 predictor on screened-stable pairs"
+
+paths:
+  input_root: data
+  output_root: runs
+
+data:
+  source: pages
+  page_dir: data/pages/stage1   # aimo extract 산출물. Git에서 제외됩니다.
+  subset_fraction: 1.0          # E4에서 0.25 / 0.5 / 1.0 nested subset으로 바꿉니다.
+  scale_floor: 1.0e-6
+
+model:
+  name: loop4
+  d_model: 128
+  n_heads: 4
+  ffn_dim: 256
+  dropout: 0.1
+  n_loops: 4
+  tied: true
+  use_variant_prefix: true
+
+train:
+  lr: 3.0e-4
+  weight_decay: 1.0e-3
+  batch_originals: 8
+  microbatch_originals: 1   # P=17, L이 큰 자료에서는 microbatch를 줄입니다.
+  grad_clip: 1.0
+  max_epochs: 100
+  patience: 15
+  cuts_per_pair: 2
+  horizons: [2, 4]
+  w_next: 1.0
+  w_within: 1.0
+  w_roll: 0.25
+
+eval:
+  horizons: [2, 4]
+  bootstrap_samples: 1000
+  support_swap: true
+
+server:
+  model_id: Qwen/Qwen3-4B
+  tiny_config: false

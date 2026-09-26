@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Secrets and personal server settings
+.env
+.env.*
+*.pem
+*.key
+credentials*.json
+configs/server.yaml
+configs/local.*.yaml
+
+# Model weights, tokenizers, dataset caches
+*.bin
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.ckpt
+weights/
+hf_cache/
+data/
+datasets/
+
+# Run outputs: results, checkpoints, logs
+runs/
+results/
+outputs/
+checkpoints/
+*.log
+wandb/
+
+# OS noise
+.DS_Store
