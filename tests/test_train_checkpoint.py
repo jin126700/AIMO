@@ -88,7 +88,7 @@ def test_resume_reproduces_uninterrupted_training(tmp_path, datasets, monkeypatc
     full = train(straight, datasets)
 
     crashed = cfg_for(tmp_path, run={"run_id": "resumed"}, train={"max_epochs": 3, "patience": 3})
-    real_validation = train_mod.validation_loss
+    real_validation = train_mod.validation_metrics
     calls = {"n": 0}
 
     def flaky(*args, **kwargs):
@@ -97,10 +97,10 @@ def test_resume_reproduces_uninterrupted_training(tmp_path, datasets, monkeypatc
             raise RuntimeError("simulated crash")
         return real_validation(*args, **kwargs)
 
-    monkeypatch.setattr(train_mod, "validation_loss", flaky)
+    monkeypatch.setattr(train_mod, "validation_metrics", flaky)
     with pytest.raises(RuntimeError, match="simulated crash"):
         train(crashed, datasets)
-    monkeypatch.setattr(train_mod, "validation_loss", real_validation)
+    monkeypatch.setattr(train_mod, "validation_metrics", real_validation)
 
     payload = torch.load(tmp_path / "resumed" / "last.pt", map_location="cpu")
     assert payload["epoch"] == 1  # epoch 0, 1까지만 저장되어 있습니다.

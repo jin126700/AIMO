@@ -1,0 +1,64 @@
+# v2 primary: 서버에서 추출한 Page + build-labels 산출물로 behavior+flow joint 학습.
+# Page shape는 자료가 결정합니다. label은 model input과 분리된 store에서 붙입니다.
+run:
+  run_id: behavior_v2
+  seed: 0
+  device: cpu          # 실제 GPU 실행은 CLI의 --execute-gpu가 필요합니다.
+  notes: "behavior-supervised joint training on screened DeepMath panels"
+
+paths:
+  input_root: data
+  output_root: runs
+
+data:
+  source: pages
+  page_dir: data/pages/behavior_v2   # aimo extract 산출물 (Git 제외)
+  label_path: data/labels/behavior_v2.json  # aimo build-labels 산출물 (Git 제외)
+  pair_path: data/pairs/frozen_pairs.json   # aimo import-pairs 산출물
+  outcome_path: data/outcomes/behavior_v2.json
+  subset_fraction: 1.0               # E4에서 0.25 / 0.5 / 1.0 nested subset
+  scale_floor: 1.0e-6
+  robust_policy:
+    # 출처와 frozen definition이 확인될 때까지 비활성화합니다 (robust label은 null).
+    enabled: false
+    definition_id: null
+    source: null
+
+model:
+  name: joint
+  d_model: 128
+  n_heads: 4
+  ffn_dim: 256
+  dropout: 0.1
+  n_loops: 4
+  tied: true
+  use_variant_prefix: true
+
+train:
+  task: joint
+  lr: 3.0e-4
+  weight_decay: 1.0e-3
+  batch_originals: 8
+  microbatch_originals: 1   # P=17, L이 큰 자료에서는 microbatch를 줄입니다
+  grad_clip: 1.0
+  max_epochs: 100
+  patience: 15
+  cuts_per_pair: 2
+  horizons: [2, 4]
+  flow_weight: 0.1
+  use_max_drop: false
+  # robust label이 아직 없으면 pair drop regression이 실제 supervision입니다.
+  select_metric: behavior_total
+
+eval:
+  horizons: [2, 4]
+  bootstrap_samples: 1000
+  support_swap: true
+  behavior: true
+
+server:
+  repo_root: /data1/HKM/AIMO
+  input_root: /data1/HKM/data
+  output_root: /data1/HKM/result/AIMO/HKM/aimo_v2
+  model_id: Qwen/Qwen3-4B
+  tiny_config: false

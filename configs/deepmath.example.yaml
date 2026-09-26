@@ -1,0 +1,69 @@
+# DeepMath primary 데이터 경로 예시. 개인 경로와 token은 이 파일에 넣지 않습니다.
+# 실제 값은 Git에서 제외되는 configs/server.yaml 로 복사해 채웁니다.
+run:
+  run_id: deepmath_prep
+  seed: 0
+  device: cpu
+  notes: "DeepMath candidate selection and split freeze"
+
+paths:
+  input_root: /data1/HKM/data
+  output_root: /data1/HKM/result/AIMO/HKM/aimo_v2
+
+data:
+  source: deepmath
+  page_dir: /data1/HKM/result/AIMO/HKM/aimo_v2/pages
+  label_path: /data1/HKM/result/AIMO/HKM/aimo_v2/labels.json
+  pair_path: /data1/HKM/result/AIMO/HKM/aimo_v2/frozen_pairs.json
+  outcome_path: /data1/HKM/result/AIMO/HKM/aimo_v2/outcomes.json
+  robust_policy:
+    enabled: false
+    definition_id: null
+    source: null
+
+model:
+  name: joint
+
+train:
+  task: joint
+  microbatch_originals: 1
+
+server:
+  repo_root: /data1/HKM/AIMO
+  input_root: /data1/HKM/data
+  output_root: /data1/HKM/result/AIMO/HKM/aimo_v2
+  gpu_block_minutes: 175    # 누적 GPU-active 175분 이상이면 새 작업 시작을 막습니다
+  gpu_stop_minutes: 180     # 진행 중이어도 180분에서 협조적으로 종료합니다
+  gpu_budget_minutes: 180   # 기본 예산 3시간
+  deepmath:
+    dataset_id: zwhe99/DeepMath-103K
+    # SERVER_PENDING: 확인한 snapshot revision을 채웁니다. 추측해서 넣지 않습니다.
+    revision: null
+    local_path: /data1/HKM/data/deepmath/deepmath-103k.parquet
+    max_candidate_originals: 300   # 후보 수이지 확보된 labeled pair 수가 아닙니다
+    require_topic: true
+    allowed_topics: ["algebra", "number theory", "combinatorics", "discrete", "geometry"]
+  thinking:
+    # 어려운 문제용 research thinking profile. 공식 AIMO 평가와 동일하지 않습니다.
+    model_id: Qwen/Qwen3-4B
+    enable_thinking: true
+    do_sample: true
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    # 아래는 서버 calibration manifest에서 확정합니다 (needs_calibration).
+    max_new_tokens: null
+    samples_per_prompt: null
+    max_total_context: null
+    numerical_backend: null
+    scorer_id: null
+    scorer_version: null
+    rope_scaling: null
+    final_cap_failure_policy: null
+  mathgap:
+    # legacy 저난도 대조 경로. 확인한 dotted path만 채웁니다.
+    revision: SERVER_PENDING
+    generator_path: null
+    renderer_path: null
+    oracle_path: null

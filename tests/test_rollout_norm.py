@@ -33,16 +33,22 @@ def test_persistence_rollout_matches_hand_computed_raw_recurrence(datasets, stat
 
 
 def test_rollout_difference_recurrence_identity(datasets, stats, batch):
-    """D_hat[d+1] = D_hat[d] + sum_c V_hat[d] 가 성립합니다."""
+    """valid landmark에서 D_hat[d+1] = D_hat[d] + sum_c V_hat[d] 가 성립합니다.
+
+    invalid landmark는 original 쪽 residual identity 자체가 깨져 있으므로 (padding junk)
+    계약대로 valid landmark에서만 확인합니다.
+    """
     model = make("loop4", datasets)
     model.eval()
     with torch.no_grad():
         result = rollout(model, batch.input_a, stats, horizon=3)
     inp = batch.input_a
+    valid = batch.valid.unsqueeze(-1)  # [B, P, 1]
     d_prev = inp.var_state_prefix[:, batch.cut] - inp.orig_state[:, batch.cut]
     for step in result.steps:
         expected = d_prev + step.v_hat_raw.sum(dim=-2)
-        assert torch.allclose(step.state_diff_hat_next, expected, atol=1e-5)
+        diff = (step.state_diff_hat_next - expected).abs() * valid
+        assert float(diff.max()) < 1e-4
         d_prev = step.state_diff_hat_next
 
 

@@ -1,0 +1,81 @@
+# E0b: CPU synthetic joint 검증 설정 (v2 primary).
+# behavior supervision + flow auxiliary를 같은 LoopedCore로 학습합니다.
+# toy label은 명시적인 synthetic 생성 규칙으로 만든 값이며 실제 LLM robustness가 아닙니다.
+run:
+  run_id: e0b_joint
+  seed: 0
+  device: cpu
+  notes: "E0b CPU synthetic behavior+flow joint verification"
+
+paths:
+  input_root: data
+  output_root: runs
+
+data:
+  source: synthetic
+  subset_fraction: 1.0
+  scale_floor: 1.0e-6
+  synthetic:
+    hidden_size: 32
+    n_blocks: 6
+    n_landmarks: 4
+    n_originals_train: 24
+    n_originals_validation: 8
+    n_originals_test: 8
+    variants_per_original: 3
+    identity_fraction: 0.1
+    invalid_landmark_prob: 0.15
+    noise_scale: 0.005
+    delta_scale: 5.0
+    harder_delta_scale: 11.0
+    # synthetic behavior label 생성 규칙
+    behavior_labels: true
+    planned_trials: 8
+    fragility_seed: 4242
+    align_strength: 1.0
+    proj_gain: 0.9
+    robust_threshold: 0.25
+    unresolved_fraction: 0.15
+  robust_policy:
+    # toy는 생성 규칙이 명시된 synthetic definition이므로 켭니다.
+    enabled: true
+    definition_id: synthetic_toy_panel_max_drop_below_threshold
+    source: aimo.data.make_synthetic_split
+
+model:
+  name: joint          # primary: behavior + flow, shared LoopedCore
+  d_model: 128
+  n_heads: 4
+  ffn_dim: 256
+  dropout: 0.1
+  n_loops: 4
+  tied: true
+  use_variant_prefix: true
+
+train:
+  task: joint
+  lr: 3.0e-4
+  weight_decay: 1.0e-3
+  batch_originals: 8
+  microbatch_originals: 4
+  grad_clip: 1.0
+  max_epochs: 100
+  patience: 15
+  cuts_per_pair: 2
+  horizons: [2, 4]
+  w_next: 1.0
+  w_within: 1.0
+  w_roll: 0.25
+  flow_weight: 0.1
+  w_robust: 1.0
+  w_pair_drop: 1.0
+  w_max_drop: 1.0
+  use_max_drop: false          # pair drop과 같은 counts에서 나오므로 기본은 끕니다
+  # 시작 전에 고정합니다. task=flow로 바꿀 때는 select_metric도 total로 함께 바꿉니다.
+  select_metric: behavior_total
+
+eval:
+  horizons: [2, 4]
+  bootstrap_samples: 200
+  support_swap: true
+  behavior: true

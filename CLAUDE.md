@@ -4,17 +4,22 @@
 
 상세 문서:
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - shape, indexing, input/output, mask,
-  loop, rollout, loss
-- [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) - dataset, split, screening, baselines,
-  metrics, 실험 순서
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - Behavior/Flow view, shape, mask, loop,
+  rollout, loss, schema version
+- [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) - dataset, split, baselines, metrics, 실험 순서
+- [docs/DATA_PROTOCOL.md](docs/DATA_PROTOCOL.md) - label, counts/bounds, provenance,
+  실행 protocol
 - [docs/SERVER_HANDOFF.md](docs/SERVER_HANDOFF.md) - 환경, 실행 명령, 산출물,
   SERVER_PENDING, 재개 방법
 
 짧게 기억할 것:
 
-- 확정 architecture를 구현합니다. 새 architecture 탐색으로 범위를 바꾸지 않습니다.
-- variant future를 model input에 넣지 않습니다. reference는 variant prefix를 읽지 않습니다.
+- 현재 primary는 **behavior supervision + flow auxiliary joint** 학습입니다
+  (`L = L_behavior + 0.1 * L_flow`). stable-only flow-only는 legacy baseline입니다.
+- Behavior와 Flow는 같은 `LoopedCore` 객체를 공유합니다. Transformer를 두 개 만들지 않습니다.
+- Flow model input에 variant future를 넣지 않습니다. reference는 variant 관측을 읽지 않습니다.
+- `BehaviorInput`에 label·ID·counts·topic·difficulty를 넣지 않습니다.
+- missing label을 0으로 바꾸지 않습니다. label 0은 실제 label입니다.
 - 설명은 한국어, 전문용어는 English로 씁니다.
 - 로컬은 CPU 전용입니다. GPU 실행에는 `--execute-gpu`가 필요합니다.
 - 검증하지 않은 것을 검증 완료라고 쓰지 않습니다.
@@ -22,5 +27,5 @@
 ```bash
 .venv/bin/python -m pytest tests/
 .venv/bin/ruff check src tests
-.venv/bin/aimo check --config configs/toy.yaml
+.venv/bin/aimo check --config configs/toy_behavior.yaml
 ```

@@ -1,3 +1,5 @@
+# legacy (v1 flow-only): E0 CPU synthetic 검증 설정.
+# v2 primary는 configs/toy_behavior.yaml 입니다.
 # E0: CPU synthetic end-to-end 검증 설정.
 # 실제 robust dataset이 아니라 leakage/rollout/reload 검증용 자료입니다.
 run:

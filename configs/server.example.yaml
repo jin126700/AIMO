@@ -1,4 +1,5 @@
-# 서버 실행 예시. 개인 경로와 token은 이 파일에 넣지 않습니다.
+# legacy (v1 flow-only) 서버 실행 예시. v2 primary는 configs/deepmath.example.yaml 입니다.
+# 개인 경로와 token은 이 파일에 넣지 않습니다.
 # 실제 값은 Git에서 제외되는 configs/server.yaml 로 복사해 채웁니다.
 run:
   run_id: aimo_v1_run001
@@ -8,11 +9,11 @@ run:
 
 paths:
   input_root: /data1/HKM/data
-  output_root: /data1/HKM/result/AIMO/HKM/aimo_v1
+  output_root: /data1/HKM/result/AIMO/HKM/aimo_v2
 
 data:
   source: pages
-  page_dir: /data1/HKM/result/AIMO/HKM/aimo_v1/pages
+  page_dir: /data1/HKM/result/AIMO/HKM/aimo_v2/pages
   subset_fraction: 1.0
   scale_floor: 1.0e-6
 
@@ -33,7 +34,7 @@ train:
 server:
   repo_root: /data1/HKM/AIMO
   input_root: /data1/HKM/data
-  output_root: /data1/HKM/result/AIMO/HKM/aimo_v1
+  output_root: /data1/HKM/result/AIMO/HKM/aimo_v2
   model_id: Qwen/Qwen3-4B
   tiny_config: false
   gpu_block_minutes: 175    # 누적 GPU-active 175분 이상이면 새 작업 시작을 막습니다.

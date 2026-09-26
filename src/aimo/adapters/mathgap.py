@@ -1,4 +1,8 @@
-"""MathGAP 최소 adapter와 screening grading.
+"""MathGAP 최소 adapter와 legacy screening grading.
+
+v2에서 MathGAP/GSM 경로는 **구현·저난도 대조용 legacy**입니다. primary 데이터 경로는
+`adapters/deepmath.py`이고, 어려운 문제용 실행 protocol은 `adapters/qwen.py`의 research
+thinking profile입니다. 이 module의 non-thinking parser를 새 경로에서 재사용하지 않습니다.
 
 MathGAP의 공식 API를 추측하지 않습니다. AIMO가 필요한 것은 세 개의 callable이며,
 서버 운영자가 확인한 실제 API 경로를 config의 dotted path로 지정합니다.

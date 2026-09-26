@@ -3,38 +3,55 @@
 Stage 1의 dataset, split, screening, 비교군, metrics, 실험 순서를 정리합니다.
 명세(계획), 구현(코드에 있는 것), 검증(실제로 돌린 것)을 구분해 적습니다.
 
-## 1. 연구 목적과 경계
+## 1. 연구 목적과 경계 (v2)
 
-Stage 1은 고정 LLM에서 반복 정답을 관측한 original-variant pair를 선별하고, 개념이나
-변형 종류 라벨 없이 내부 update 흐름을 자기지도학습합니다. 중점은 모든 state 좌표를
-완벽히 복원하는 것이 아니라, 서로 다른 variants의 **변화 방향·규모·깊이별 전개**를
-구분해 예측하는 것입니다.
+현재 primary는 **행동 감독으로 유용한 내부 변화 representation을 학습하는 것**입니다.
+robust/non-robust 또는 correctness drop을 감독 신호로 쓰고, Flow prediction은 실제 내부
+전개를 설명하게 하는 auxiliary입니다.
 
-Stage 2는 후속 단계입니다. predictor·normalization·관측 protocol을 freeze한 뒤, 실패
-pair의 residual 양상이 robustness와 연결되는지 검증합니다. **이번 revision에는 Stage 2
-classifier와 threshold를 구현하지 않습니다.**
+```
+L = L_behavior + 0.1 * L_flow
+```
 
-구분해서 기억할 것:
+이전 목표(screened-stable pair만으로 flow를 학습하고 예측 오차가 failure와 연결되는지
+후속 검사)는 **legacy baseline**으로 보존합니다. 용어 정리:
 
+| 용어 | 지금의 뜻 |
+| --- | --- |
+| primary | supervised behavior + flow joint training (`train.task=joint`) |
+| behavior-only | 같은 core로 behavior head만 학습 (`train.task=behavior`) |
+| legacy flow-only | stable-only anomaly 접근, v1 설정 (`train.task=flow`) |
+
+경계:
+
+- Flow는 성공·실패 양쪽의 유효한 train pair에서 학습합니다. sibling label 조합을
+  제한하지 않습니다 (stable-stable / stable-failed / failed-failed 모두 허용).
+- **prediction residual 자체를 non-robust probability로 쓰지 않습니다.**
+- concept / recipe / 중요 layer / Gram matrix를 target으로 주지 않습니다.
+- 완전한 비지도학습이 아니라 outcome-supervised representation learning입니다.
+- correctness, robustness, uncertainty, causal mechanism을 구분합니다.
+- 특정 label을 잘 예측했다고 수학적 구조나 인과성을 발견했다고 쓰지 않습니다.
 - 4/4 성공은 population robustness 인증이 아닙니다.
-- 데이터 선별에는 correctness supervision이 쓰입니다.
-- predictor에는 정답·concept·recipe·robustness label을 주지 않습니다.
-- 큰 prediction error가 곧 non-robust를 뜻하지 않습니다.
-- 새로운 정상 perturbation과 실제 실패를 구분해야 합니다.
-- 초기 대상은 Qwen3-4B 하나입니다.
-- Cross-model transfer는 후속 목표이며, 이번 검증 결과로 주장하지 않습니다.
+- 데이터 선별에는 correctness supervision이 쓰이지만 predictor input에는 정답·concept·
+  recipe·robustness label이 들어가지 않습니다.
+- 초기 대상은 Qwen3-4B 하나입니다. Cross-model transfer는 후속 목표이며 이번 결과로
+  주장하지 않습니다.
+- head를 구현했다는 사실과 실제 label로 학습했다는 사실을 구분합니다. behavior
+  supervision이 전혀 없는 실행은 joint 성공으로 보고하지 않습니다.
 
 ## 2. 실험 순서
 
 | 실험 | 내용 | 상태 |
 | --- | --- | --- |
-| E0 | CPU synthetic end-to-end, leakage, rollout, reload 검증 | 로컬에서 실제 실행 완료 |
-| E1 | 서버에서 MathGAP screening과 Qwen3-4B Page extraction 검증 | SERVER_PENDING |
-| E2 | screened-stable 자료로 실제 update 흐름 학습 | SERVER_PENDING |
-| E3 | 새 original·새 perturbation·높은 난이도 평가 | SERVER_PENDING |
-| E4 | 독립 original 25/50/100% 학습곡선으로 data efficiency 비교 | 기계는 구현/toy에서 실행, 실자료는 SERVER_PENDING |
+| E0 | (legacy) flow-only CPU synthetic end-to-end, leakage/rollout/reload 검증 | 실행 완료 |
+| E0b | CPU synthetic **behavior+flow joint** end-to-end, label routing/gradient/reload 검증 | 실행 완료 |
+| E1 | 서버에서 DeepMath 후보·split freeze, 검증된 pair 확보, Page extraction 검증 | SERVER_PENDING |
+| E1c | 작은 calibration으로 model policy / scorer / budget 확정 (runtime·VRAM·완료율·원본 정답률·label uncertainty 확인) | SERVER_PENDING |
+| E2 | 반복 행동 측정 -> label 연결 -> behavior-only / joint 학습 | SERVER_PENDING |
+| E3 | 새 original·새 perturbation·higher difficulty 평가 | SERVER_PENDING |
+| E4 | 독립 original 25/50/100% 학습곡선으로 data efficiency 비교 | 기계는 구현, toy에서 실행. 실자료는 SERVER_PENDING |
 
-Stage 2는 이 순서 뒤에 오며 이번에 실행하지 않습니다.
+300개 원문을 곧바로 대규모 generation으로 시작하지 않습니다. E1c calibration을 먼저 돕니다.
 
 ## 3. Dataset과 split
 
@@ -63,21 +80,21 @@ dynamics를 가집니다. split 사이에서 한 번에 한 요인만 바뀝니�
 따라서 `known -> unseen` 차이는 새 perturbation 효과, `unseen -> harder` 차이는 난이도
 효과로 읽습니다. 이것은 검증용 자료이며 실제 robust dataset이 아닙니다.
 
-## 4. Screening (E1)
+## 4. 행동 측정 (E1 / E2)
 
-MathGAP generator/renderer/oracle는 최소 adapter로 연결합니다. 공식 API와 revision의
-필요한 부분만 config의 dotted path로 지정하며, 확인하지 못한 API는 추측해서 지원한다고
-쓰지 않습니다. 경로가 비어 있으면 adapter가 SERVER_PENDING으로 fail-fast합니다.
-
-초기 screening 설정:
+새 DeepMath 경로는 research thinking profile을 씁니다. 자세한 규칙과 provenance 요구사항은
+[DATA_PROTOCOL.md](DATA_PROTOCOL.md)에 있습니다. 여기에는 실험 설계에 필요한 부분만 적습니다.
 
 ```
-non-thinking, temperature = 0.7, top_p = 0.8, top_k = 20, min_p = 0
-max_new_tokens = 256, unique prompt당 독립 4 slots
+model_id = Qwen/Qwen3-4B, enable_thinking = true, do_sample = true
+temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0
+max_new_tokens / samples_per_prompt / max_total_context /
+numerical_backend / scorer_id / scorer_version  ->  needs_calibration (E1c)
 ```
 
-고정 final-answer parser(마지막 `\boxed{}` -> `answer:` 라벨 -> 마지막 숫자)와 exact
-oracle을 씁니다. 이는 **연구용 screening**이며 공식 AIMO 평가 정책이 아닙니다.
+이는 Qwen thinking 기반 **연구 profile**이며 공식 AIMO 평가와 동일하지 않습니다. legacy
+non-thinking / 256-token screening 설정(MathGAP 경로)은 저난도 대조용으로 보존하지만 새
+경로에서 조용히 재사용하지 않습니다.
 
 slot outcome은 분리해서 셉니다.
 
@@ -85,77 +102,243 @@ slot outcome은 분리해서 셉니다.
 | --- | --- |
 | `C` | 정답 |
 | `W` | 오답 |
-| `X` | cap-hit (max_new_tokens에서 잘림). `W`로 합치지 않습니다. |
-| `U_score` | 채점 불가 (답을 못 뽑음) |
+| `X` | cap-hit / 미완료. `W`로 합치지 않습니다. |
+| `U_score` | 채점 불가 (제출 형식 없음) |
 | `infra_error` | 실행 오류 |
 | `not_started` | 시작되지 않음 |
 
-Eligibility는 `semantic-valid AND original C4 AND variant C4`입니다. 실패하거나 미확정인
-pair를 성공할 때까지 다시 생성하지 않습니다.
+**중요한 변경**: primary loader에서 "C4 pair만 남김" 필터를 제거했습니다. 성공·실패·성능
+유지·개선 사례를 모두 보존하고, 미확정 pair만 behavior loss에서 제외합니다 (flow에는 쓸 수
+있습니다). 실패하거나 미확정인 pair를 성공할 때까지 다시 생성하지 않습니다.
 
 Qwen adapter는 random-init tiny config로 CPU에서 검증합니다. 실제 4B weights는 로컬에서
-내려받지 않으며, real screening과 4B numerical audit는 SERVER_PENDING입니다.
+내려받지 않으며, real behavior measurement와 4B numerical audit는 SERVER_PENDING입니다.
 
 ## 5. 비교군
 
-| 이름 | 설명 |
-| --- | --- |
-| `persistence` | `V_hat = 0` |
-| `linear` | 작은 linear conditional baseline |
-| `m0` | original-only. pair-specific 정보 없음 |
-| `loop1` | shared block 1회 |
-| `loop4` | shared block 4회. **primary** |
-| `untied4` | 독립 block 4개 |
+주 비교는 behavior 예측입니다.
 
-같은 input/output/data/loss 조건으로 비교합니다. baseline 특성상 다른 부분은 명시합니다:
-`persistence`는 parameter가 없고, `m0`는 observed variant cell을 sequence에서 뺍니다.
+| 이름 | task | 설명 |
+| --- | --- | --- |
+| `constant` | behavior | constant/prior baseline (상수 drop + 상수 robust logit, 2 params) |
+| `raw_change` | behavior | 작은 raw-change baseline (scalar 3개만 봅니다) |
+| `behavior_m0` | behavior | original-only. variant 관측·길이·validity·ID·count가 들어가지 않습니다 |
+| `behavior` | behavior | 같은 Looped core, behavior-only |
+| `joint` | joint | behavior + flow. **primary** |
+| `joint_loop1` / `joint_untied4` | joint | shared block 1회 / 독립 block 4개 |
+| `loop4` | flow | legacy flow-only (auxiliary 비교) |
 
-Support-swap은 **같은 original의 sibling variants 사이에서만** 수행합니다. original
-참조와 target은 그대로 두고 관측 prefix만 sibling의 것으로 바꿉니다.
+`persistence` / `linear` / `m0` / `loop1` / `untied4`(flow)와 original 25/50/100% 학습곡선도
+그대로 유지합니다. M0에는 variant count / 길이 / label validity가 새지 않아야 하며, panel
+크기·source·난이도의 영향은 별도로 보고합니다.
 
 ## 6. Metrics
 
-- next-update raw MSE / normalized MSE
-- direction cosine (landmark x stream 단위, H 방향)
-- relative magnitude (`||V_hat|| / ||V||`)
-- 2-step / 4-step rollout error (normalized)
-- sibling-difference gain (`1 - MSE(V_hat_a - V_hat_b, V_a - V_b) / MSE(0, V_a - V_b)`)
-- correct-support vs swapped-support degradation
-- identity example의 normalized MSE (zero-V 대조)
+### Pair drop
 
-집계 규칙:
+- MAE / Huber(delta=0.1)
+- 같은 original 내 variant별 예측 차이(spread)와 순위 상관(Spearman)
+- sampling uncertainty: 저장된 drop bound 폭
+- supervised coverage: 실제 drop label이 있는 pair 비율
 
-- zero/noise norm의 cosine과 relative magnitude는 값을 만들지 않고 **undefined로 셉니다**.
-- 집계 단위는 항상 original group입니다. layer나 variant를 독립 원문처럼 세지 않습니다.
-- 불확실성은 original-group bootstrap으로 보고하고, training seed 사이의 분산은 별도로
-  기록합니다. bootstrap CI는 seed variance가 아닙니다.
+### Robust classification (label이 있을 때만)
 
-보고 기준:
+- accuracy, balanced accuracy
+- 양 class recall / precision
+- AUROC, Brier, log-loss
+- confusion counts (tp / fp / tn / fn)
+- 한 class로만 예측했는지(`predicted_all_one_class`)와 majority-class accuracy
 
-- train만 좋아지거나 `m0`와 차이가 없으면, pair-specific 변화를 배웠다는 근거가 부족한
-  것으로 보고합니다.
-- unseen perturbation 일반화와 harder 일반화는 각각 따로 평가합니다.
+### Flow (auxiliary)
 
-## 7. 로컬 재현 명령 (E0)
+next-update raw/normalized MSE, direction cosine, relative magnitude, 2/4-step rollout
+error, sibling-difference gain, support-swap degradation.
+
+### 집계와 해석 규칙
+
+- 집계 단위는 original panel입니다. 같은 원문의 variants나 layers를 독립 문제로 세지
+  않습니다.
+- 불확실성은 original-group bootstrap으로 보고하고 training seed variance와 구분합니다.
+- zero/noise norm의 cosine과 relative magnitude는 undefined로 셉니다.
+- **같은 panel의 variants 순서를 바꾸는 것은 set pooling의 permutation invariance 검사이며
+  pair 정보 사용 여부의 강한 ablation이 아닙니다.**
+- **Pair support-swap**은 target variant를 고정한 채 같은 original의 다른 variant Page를
+  대입해 pair-drop 변화를 봅니다. panel 단순 재정렬의 불변성과 구분합니다.
+- 모두 non-robust로 예측해 accuracy가 높아진 것을 성공이라고 하지 않습니다.
+- 새 원문 / 새 perturbation / higher difficulty를 각각 따로 보고합니다.
+- 관측 성능을 causal mechanism이나 전체 AIMO 제출 성능으로 확대하지 않습니다.
+- train만 좋아지거나 `behavior_m0`와 차이가 없으면 pair-specific 행동 신호를 배웠다는
+  근거가 부족한 것으로 보고합니다.
+
+## 7. 로컬 재현 명령
 
 ```bash
 python3 -m venv --system-site-packages .venv
 .venv/bin/pip install -e ".[dev]"
 .venv/bin/python -m pytest tests/
-.venv/bin/aimo check --config configs/toy.yaml
-.venv/bin/aimo make-toy --config configs/toy.yaml --out runs/e0_toy/pages
-.venv/bin/aimo train --config configs/toy.yaml --run-id e0_loop4 --set model.name=loop4
-.venv/bin/aimo evaluate --config configs/toy.yaml --run-id e0_loop4 --set model.name=loop4 \
+.venv/bin/ruff check src tests
+
+# E0b (v2 primary): behavior + flow joint
+.venv/bin/aimo check      --config configs/toy_behavior.yaml
+.venv/bin/aimo make-toy   --config configs/toy_behavior.yaml --out runs/e0b_pages
+.venv/bin/aimo preflight  --config configs/toy_behavior.yaml --run-id e0b_pre
+.venv/bin/aimo train      --config configs/toy_behavior.yaml --run-id e0b_behavior \
+  --set model.name=behavior --set train.task=behavior
+.venv/bin/aimo train      --config configs/toy_behavior.yaml --run-id e0b_joint \
+  --set model.name=joint --set train.task=joint
+.venv/bin/aimo evaluate   --config configs/toy_behavior.yaml --run-id e0b_joint \
+  --set model.name=joint --set train.task=joint \
   --splits validation known_test unseen_perturbation_test harder_test
-.venv/bin/aimo predict --config configs/toy.yaml --run-id e0_loop4 --set model.name=loop4 --cut 2
+.venv/bin/aimo predict-behavior --config configs/toy_behavior.yaml --run-id e0b_joint \
+  --set model.name=joint --set train.task=joint --split known_test --n-originals 4
+
+# legacy flow-only (select_metric도 함께 바꿉니다)
+.venv/bin/aimo train --config configs/toy_behavior.yaml --run-id e0b_flow_legacy \
+  --set model.name=loop4 --set train.task=flow --set train.select_metric=total
 ```
 
-비교군은 `--set model.name=<name> --run-id e0_<name>`으로 같은 방식으로 돌립니다.
-seed variance는 `--set run.seed=1`처럼 seed만 바꿔 여러 run을 만들고,
-data efficiency는 `--set data.subset_fraction=0.25`로 만듭니다. 결과는
-`aimo evaluate --compare runs/e0_loop4 runs/e0_m0 ...`로 한 표에 모읍니다.
+비교군은 `--set model.name=<name> --set train.task=<task> --run-id e0b_<name>`으로 같은
+방식으로 돌리고, data efficiency는 `--set data.subset_fraction=0.25`로 만듭니다. 결과는
+`aimo evaluate --compare runs/e0b_joint runs/e0b_m0 ...`로 한 표에 모읍니다.
 
-## 8. E0 실행 결과 (로컬 CPU, 실측)
+label 경로(실자료 기준)는 다음 순서입니다.
+
+```bash
+.venv/bin/aimo prepare-data     --config configs/deepmath.example.yaml --input <snapshot>
+.venv/bin/aimo import-pairs     --config configs/behavior.yaml --input <verified_pairs.jsonl>
+.venv/bin/aimo collect-outcomes --config configs/behavior.yaml --from-file <outcomes.jsonl>
+.venv/bin/aimo build-labels     --config configs/behavior.yaml
+```
+
+## 8. E0b 실행 결과 (로컬 CPU, 실측)
+
+설정: toy synthetic `H=32, L=6, P=4`, train 24 originals / 72 pairs, validation·각 test split
+8 originals / 24 pairs, 100 epochs 상한, patience 15, `AdamW lr 3e-4`, effective batch 8
+originals, `L = L_behavior + 0.1 * L_flow`, `use_max_drop: false`,
+`select_metric: behavior_total`. **toy label은 명시적인 synthetic 생성 규칙으로 만든 값이며
+실제 LLM robustness가 아닙니다.** 이 실행의 목적은 성능 우열이 아니라 end-to-end 학습·label
+routing·gradient·reload 검증입니다.
+
+train split의 label coverage (실측):
+
+```
+pairs 72, drop label 있는 pair 54 (제외율 25.0%)
+제외 사유: identity_no_behavior_label 8, unresolved_trials 10
+panels 24, robust label 있는 panel 15 (나머지는 partial coverage -> null)
+panel-only max-drop target 0개  ->  max-drop loss는 꺼짐 (diagnostic만)
+```
+
+### known-test: pair drop과 robust classification
+
+`dropMAE`는 낮을수록, `rankCorr`(panel 안 순위 상관)와 `acc`/`auroc`는 높을수록 좋습니다.
+`spread`는 같은 panel 안 예측의 표준편차, `swapMAE+`는 pair support-swap 후 MAE 증가량입니다.
+
+| run | task | params | dropMAE | rankCorr | spread | swapMAE+ | acc | balAcc | auroc | brier |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `constant` | behavior | 2 | 0.2735 | n/a | 0.0000 | 0.0000 | 0.400 | 0.500 | 0.500 | 0.2500 |
+| `raw_change` | behavior | 8 | 0.8108 | -0.125 | 0.0182 | 0.0352 | 0.400 | 0.500 | 0.000 | 0.3775 |
+| `behavior_m0` | behavior | 186,147 | 0.3352 | n/a | 0.0000 | 0.0000 | 0.600 | 0.583 | 0.667 | 0.2494 |
+| `behavior` | behavior | 186,147 | 0.2370 | 1.000 | 0.2692 | -0.0362 | 0.800 | 0.833 | 1.000 | 0.1166 |
+| **`joint`** | joint | 186,147 | **0.1638** | 0.875 | 0.2179 | **0.0521** | 0.800 | 0.833 | 1.000 | 0.1531 |
+| `joint_loop1` | joint | 186,147 | 0.1908 | 0.875 | 0.1438 | 0.0207 | 0.800 | 0.833 | 1.000 | 0.1423 |
+| `joint_untied4` | joint | 583,587 | 0.2284 | 1.000 | 0.1824 | -0.0524 | 0.800 | 0.833 | 0.833 | 0.1416 |
+
+읽는 방법과 한계:
+
+- `behavior_m0`는 panel 안 예측 spread가 정확히 0이고 rank 상관이 undefined입니다. variant
+  관측을 받지 않으므로 **variant를 구분할 수 없다**는 것이 수치로 확인됩니다.
+- `joint`는 `behavior`(0.237)와 `behavior_m0`(0.335)보다 pair drop MAE가 낮고, pair
+  support-swap을 하면 MAE가 늘어납니다(+0.052). 즉 target variant의 Page를 실제로 쓰고
+  있습니다.
+- **`constant`(2 params)가 `behavior_m0`(186k params)보다 MAE가 낮습니다.** variant 정보가
+  없는 큰 모델은 상수 예측보다 나쁠 수 있습니다. MAE 하나만 보고 비교하면 안 됩니다.
+- `joint_untied4`는 parameter가 3.1배인데 `joint`보다 나쁩니다. shared block 4회가 더
+  많은 parameter를 쓰지 않고 같거나 더 좋은 수준에 도달합니다.
+- `behavior`(behavior-only)의 `swapMAE+`는 음수(-0.036)입니다. 이 설정에서는 support-swap이
+  오차를 줄였다는 뜻이므로, behavior-only만으로는 pair-specific 사용의 증거가 약합니다.
+- robust classification의 labeled panel은 split당 5~7개뿐입니다. accuracy와 AUROC는 이
+  표본 크기에서 해석해야 하며, synthetic 규칙이 학습 가능하도록 만들어졌기 때문에 높은
+  값이 나옵니다. **실제 LLM robustness 성능이 아닙니다.**
+
+### joint의 split별 지표와 bootstrap CI
+
+original-group bootstrap 200회, 95% CI입니다.
+
+| split | dropMAE [CI] | rankCorr [CI] | swapMAE+ [CI] | robust acc (n_panels, pos/neg) | AUROC | Brier |
+| --- | --- | --- | --- | --- | --- | --- |
+| validation | 0.1030 [0.064, 0.150] | 0.875 [0.625, 1.000] | 0.0657 [0.014, 0.121] | 1.000 (7, 4/3) | 1.000 | 0.0162 |
+| known_test | 0.1638 [0.118, 0.216] | 0.875 [0.747, 1.000] | 0.0521 [-0.042, 0.145] | 0.800 (5, 2/3) | 1.000 | 0.1531 |
+| unseen_perturbation | 0.1001 [0.068, 0.129] | 0.750 [0.500, 1.000] | 0.0274 [-0.017, 0.078] | 1.000 (7, 4/3) | 1.000 | 0.0034 |
+| harder | 0.1224 [0.074, 0.201] | 0.625 [0.500, 0.875] | 0.1066 [0.031, 0.203] | 1.000 (6, 3/3) | 1.000 | 0.0000 |
+
+`swapMAE+`의 CI는 known_test와 unseen에서 0을 포함합니다. pair 정보 사용의 증거는
+validation과 harder에서 더 뚜렷하고, known_test에서는 이 표본 크기로 단정할 수 없습니다.
+`drop_bound_width`(sampling uncertainty) 평균은 split별로 0.016~0.037입니다.
+
+### Flow auxiliary (같은 자료, known_test)
+
+| run | next MSE | cosine | rollout h2 | sibling gain |
+| --- | --- | --- | --- | --- |
+| `joint` | 0.4231 | 0.156 | 0.0796 | 0.054 |
+| `joint_loop1` | 0.4707 | 0.069 | 0.0917 | 0.004 |
+| `joint_untied4` | 0.4771 | 0.041 | 0.0964 | 0.007 |
+| `loop4` (legacy flow-only) | 0.2571 | 0.629 | 0.0532 | 0.580 |
+
+flow-only로 100 epochs 학습한 legacy가 flow 지표에서는 joint보다 훨씬 좋습니다. joint에서는
+flow가 가중치 0.1의 auxiliary이고 behavior 지표로 checkpoint를 골랐으며 43 epoch에서
+멈췄습니다. **joint가 flow 예측에서도 더 낫다고 주장하지 않습니다.**
+
+### 데이터 효율 (E4 형식, toy)
+
+original-group 단위 고정 nested subset이고 normalization도 각 subset 안에서 다시 계산합니다.
+
+| train originals | dropMAE (known_test) | rankCorr | spread | robust acc |
+| --- | --- | --- | --- | --- |
+| 6 (25%) | 0.4045 | 0.750 | 0.0201 | 0.000 |
+| 12 (50%) | 0.2766 | 0.750 | 0.0162 | 0.400 (한 class로만 예측) |
+| 24 (100%) | 0.1638 | 0.875 | 0.2179 | 0.800 |
+
+원문 수가 줄면 panel 안 예측 spread가 거의 0으로 붕괴하고 robust head가 한 class로만
+예측합니다. 실자료에서도 원문 수가 지배적인 요인일 가능성이 있습니다.
+
+### Seed variance (bootstrap CI와 다른 양)
+
+`joint`을 seed 0/1/2로 돌린 known_test 결과입니다.
+
+| seed | epochs (best) | dropMAE | rankCorr | swapMAE+ | robust acc | AUROC |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | 43 (27) | 0.1638 | 0.875 | 0.0521 | 0.800 | 1.000 |
+| 1 | 33 (17) | 0.0935 | 1.000 | 0.0543 | 0.571 | 0.917 |
+| 2 | 27 (11) | 0.1782 | 0.375 | -0.0063 | 0.833 | 0.889 |
+| mean ± sd | | 0.1452 ± 0.0453 | 0.750 ± 0.331 | 0.0334 ± 0.0344 | 0.735 ± 0.143 | 0.935 ± 0.058 |
+
+- 이 값은 seed 0의 original-group bootstrap CI(`dropMAE` [0.118, 0.216])와 **다른 양**입니다.
+  두 폭이 비슷하므로 seed 하나만 보고 model을 비교하면 안 됩니다.
+- **주의**: `run.seed`는 synthetic 자료 생성과 학습 초기화를 함께 바꿉니다. 따라서 위 값은
+  순수 training seed variance가 아니라 **data + training seed variance**입니다. 순수 training
+  seed variance를 보려면 자료를 고정한 채 초기화만 바꿔야 합니다.
+- `swapMAE+`는 seed 2에서 음수(-0.006)입니다. pair support-swap으로 본 pair 정보 사용의
+  증거는 이 toy 표본 크기에서 **seed에 걸쳐 안정적이지 않습니다.** 실자료에서 다시
+  확인해야 합니다.
+- robust accuracy는 labeled panel이 5개뿐이어서 한 panel 차이로 0.2씩 움직입니다.
+
+### 검증된 항목 (실행 기준)
+
+- behavior-only 학습, joint 학습, pair/panel/flow 평가, serialization/reload를 실제로 실행
+- 같은 `LoopedCore`에 두 view의 gradient가 누적되고 shared parameter가 optimizer에 한 번만
+  등록됨
+- behavior forward 뒤에도 flow 예측이 bit 단위로 동일 (future leakage 없음)
+- panel 재정렬에 대한 robust probability 변화 최대 `2.8e-09` (permutation invariance)
+- 별개 process에서 `predict-behavior`를 두 번 실행해 panel 출력이 완전히 동일
+- 학습되지 않은 head(`max_drop`)가 untrained로 표시됨
+- label 제외율 25%와 제외 사유가 그대로 보고됨
+
+## 9. E0 실행 결과 (legacy flow-only, 로컬 CPU, 실측)
+
+아래는 v1 flow-only 설정(`configs/toy.yaml`, stable-only 가정)에서 측정한 legacy
+baseline입니다. v2 primary 결과와 같은 자료가 아니므로 직접 비교하지 않습니다.
+(v2에서 synthetic 생성 규칙이 behavior label을 포함하도록 바뀌었으므로 숫자를 그대로 재현하려면
+v1 revision을 쓰세요.)
 
 설정: toy synthetic `H=32, L=6, P=4`, train 24 originals / 72 variants (identity 11%),
 validation·각 test split 8 originals / 24 variants, 100 epochs, patience 15,
@@ -169,7 +352,7 @@ validation·각 test split 8 originals / 24 variants, 100 epochs, patience 15,
 | linear | 6,592 | 0.2289 | 0.6104 | 0.7226 | 0.0446 | 0.1193 | 0.5372 | 0.3306 |
 | M0 (original-only) | 168,608 | 0.4795 | -0.0926 | 0.1942 | 0.0984 | 0.2686 | 0.0000 | 0.0000 |
 | loop1 | 168,608 | 0.2737 | 0.6556 | 1.0506 | 0.0623 | 0.1863 | 0.6222 | 0.4484 |
-| **loop4 (primary)** | 168,608 | **0.2606** | **0.6906** | 1.0843 | 0.0566 | 0.1679 | **0.6364** | **0.4618** |
+| **loop4 (v1 primary)** | 168,608 | **0.2606** | **0.6906** | 1.0843 | 0.0566 | 0.1679 | **0.6364** | **0.4618** |
 | untied4 | 566,048 | 0.2446 | 0.7101 | 1.0495 | 0.0547 | 0.1592 | 0.6537 | 0.4737 |
 
 `next MSE`/`h2`/`h4`는 낮을수록, `cosine`/`sibling gain`/`swap deg.`는 높을수록 좋습니다.

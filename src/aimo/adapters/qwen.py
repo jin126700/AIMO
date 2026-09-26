@@ -23,6 +23,7 @@ tiny config만 씁니다. 실제 screening과 4B numerical audit는 SERVER_PENDI
 from __future__ import annotations
 
 import importlib
+import re
 from contextlib import ExitStack
 from dataclasses import dataclass
 
@@ -241,4 +242,146 @@ def screening_ready() -> dict:
             " 내려받지 않으며 numerical audit도 수행하지 않습니다."
         ),
         "qwen_probe": probe,
+    }
+
+
+# --------------------------------------------------------------------------------------
+# v2 research thinking protocol (어려운 문제용)
+# --------------------------------------------------------------------------------------
+
+THINK_OPEN = "<think>"
+THINK_CLOSE = "</think>"
+
+# 최종 답 제출 형식. thinking 블록 밖에서만 찾습니다.
+_FINAL_BOXED = re.compile(r"\\boxed\{([^{}]*)\}")
+_FINAL_LABEL = re.compile(r"(?:final answer)\s*[:=]\s*(.+)", re.IGNORECASE)
+
+SCORER_ID = "aimo.thinking.exact_final_answer"
+SCORER_VERSION = "1"
+
+
+def split_thinking(text: str) -> tuple[str, str, bool]:
+    """(thinking, answer_region, closed)로 나눕니다.
+
+    thinking 블록이 닫히지 않았으면 answer region은 비어 있고 closed=False입니다. 생각
+    중간에 정답 숫자가 나타났다는 이유로 C 처리하지 않기 위해 answer region만 채점합니다.
+    """
+    if THINK_OPEN not in text and THINK_CLOSE not in text:
+        return "", text, True  # thinking을 쓰지 않은 응답
+    head, _, rest = text.partition(THINK_OPEN)
+    thinking, closer, tail = rest.partition(THINK_CLOSE)
+    if not closer:
+        return thinking, "", False
+    return thinking, head + tail, True
+
+
+def parse_submitted_answer(answer_region: str) -> str | None:
+    """answer region에서 제출된 최종 답만 뽑습니다. 없으면 None입니다.
+
+    마지막 \\boxed{...} -> 마지막 "final answer:" 라벨 순서입니다. 임의의 마지막 숫자를
+    정답으로 쓰지 않습니다 (thinking 경로에서는 오판 위험이 큽니다).
+    """
+    boxed = _FINAL_BOXED.findall(answer_region)
+    if boxed:
+        return _normalize_answer(boxed[-1])
+    labelled = _FINAL_LABEL.findall(answer_region)
+    if labelled:
+        return _normalize_answer(labelled[-1].splitlines()[0])
+    return None
+
+
+def _normalize_answer(value: str) -> str:
+    cleaned = value.strip().strip("$").rstrip(".").replace(",", "").replace(" ", "")
+    return cleaned
+
+
+def score_answer(predicted: str | None, gold: str) -> bool:
+    """version pin된 exact scorer. LLM judge를 쓰지 않습니다."""
+    if predicted is None:
+        return False
+    left, right = _normalize_answer(predicted), _normalize_answer(gold)
+    try:
+        return abs(float(left) - float(right)) < 1e-9
+    except ValueError:
+        return left == right
+
+
+def check_total_context(prompt_tokens: int, generated_tokens: int, limit: int | None) -> None:
+    """prompt + generated token 합계를 검사합니다.
+
+    한도를 조용히 늘리거나 truncate하지 않고 오류로 알립니다.
+    """
+    if limit is None:
+        raise ValueError(
+            "max_total_context is not calibrated yet; set it in the server calibration "
+            "manifest before running generation"
+        )
+    total = prompt_tokens + generated_tokens
+    if total > limit:
+        raise ValueError(
+            f"total context {total} (prompt {prompt_tokens} + generated {generated_tokens}) "
+            f"exceeds the configured limit {limit}; do not truncate or raise it silently"
+        )
+
+
+def classify_thinking_slot(
+    *,
+    started: bool,
+    infra_error: bool,
+    hit_cap: bool,
+    is_final_cap: bool,
+    text: str | None,
+    gold: str,
+) -> str:
+    """thinking profile의 slot outcome.
+
+    cap-hit, 운영 중단, 채점 모호를 W로 합치지 않습니다. 중간 checkpoint의 미완료(X)와
+    명시된 최종 scoring deadline(is_final_cap)을 구분합니다. 최종 cap에서 실패로 볼지는
+    protocol의 final_cap_failure_policy로 따로 정합니다.
+    """
+    from ..labels import (
+        OUTCOME_CAP_HIT,
+        OUTCOME_CORRECT,
+        OUTCOME_INFRA_ERROR,
+        OUTCOME_NOT_STARTED,
+        OUTCOME_UNSCORED,
+        OUTCOME_WRONG,
+    )
+
+    if not started:
+        return OUTCOME_NOT_STARTED
+    if infra_error:
+        return OUTCOME_INFRA_ERROR
+    _thinking, answer_region, closed = split_thinking(text or "")
+    if not closed:
+        # thinking이 닫히지 않은 미완료 generation을 completed-wrong으로 기록하지 않습니다.
+        return OUTCOME_CAP_HIT
+    submitted = parse_submitted_answer(answer_region)
+    if submitted is None:
+        return OUTCOME_CAP_HIT if hit_cap else OUTCOME_UNSCORED
+    if hit_cap and not is_final_cap:
+        return OUTCOME_CAP_HIT
+    return OUTCOME_CORRECT if score_answer(submitted, gold) else OUTCOME_WRONG
+
+
+def thinking_ready(profile) -> dict:
+    """thinking profile의 calibration 상태를 보고합니다."""
+    pending = profile.needs_calibration()
+    return {
+        "model_id": profile.model_id,
+        "enable_thinking": profile.enable_thinking,
+        "sampling": {
+            "do_sample": profile.do_sample,
+            "temperature": profile.temperature,
+            "top_p": profile.top_p,
+            "top_k": profile.top_k,
+            "min_p": profile.min_p,
+        },
+        "needs_calibration": pending,
+        "protocol_hash": profile.protocol_hash(),
+        "scorer": {"id": SCORER_ID, "version": SCORER_VERSION},
+        "status": SERVER_PENDING if pending else "calibrated",
+        "note": (
+            "Qwen thinking 기반 연구 profile입니다. 공식 AIMO 평가와 동일하지 않습니다."
+        ),
     }

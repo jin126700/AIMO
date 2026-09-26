@@ -1,16 +1,21 @@
 """aimo CLI. python -m aimo 도 같은 진입점을 씁니다.
 
 명령
-  check         환경과 데이터 계약 self-check
-  make-toy      E0 synthetic Page 생성
-  train         Stage 1 predictor 학습
-  evaluate      checkpoint 평가, 또는 여러 run 비교
-  predict       checkpoint로 한 batch V_hat 예측
-  preflight     서버 실행 전 dry-run (model weights를 읽지 않습니다)
-  prepare-data  MathGAP 자료 준비 (adapter 설정 필요)
-  screen        실제 screening (--execute-gpu 필요)
-  extract       Page 추출 (--tiny는 CPU random-init 검증, 실제 weights는 --execute-gpu)
-  run-stage1    prepare-data -> screen -> extract -> train 순서 실행
+  check            환경과 데이터 계약 self-check
+  make-toy         synthetic Page + behavior label 생성
+  prepare-data     DeepMath 후보/split 준비 (legacy: MathGAP)
+  import-pairs     검증된 original-variant pair import 후 freeze
+  collect-outcomes 행동 측정 결과(outcome counts) 적재 (실제 generation은 --execute-gpu)
+  build-labels     outcome counts -> pair drop / panel label store
+  extract          Page 추출 (--tiny는 CPU random-init 검증, 실제 weights는 --execute-gpu)
+  train            behavior / flow / joint 학습
+  resume           같은 config로 train 이어서 실행
+  evaluate         checkpoint 평가(behavior + flow), 또는 여러 run 비교
+  predict          checkpoint로 한 batch V_hat 예측 (flow view)
+  predict-behavior checkpoint로 pair drop / panel robust probability 예측
+  preflight        서버 실행 전 dry-run (model weights를 읽지 않습니다)
+  screen           legacy screening (--execute-gpu 필요)
+  run-stage1       legacy flow 경로 단계 실행
 
 기본 동작은 dry-run/preflight이며 model weights를 로드하지 않습니다. 실제 GPU 실행은
 --execute-gpu를 명시해야 합니다.
@@ -29,7 +34,9 @@ import torch
 
 from .config import Config, load_config
 from .data import (
+    attach_labels,
     collate,
+    collate_panels,
     compute_norm_stats,
     group_by_cut,
     load_dataset,
@@ -37,7 +44,8 @@ from .data import (
     sample_pairs,
     save_dataset,
 )
-from .evaluate import evaluate_dataset
+from .evaluate import evaluate_behavior, evaluate_dataset
+from .labels import BinaryRobustPolicy, LabelStore, OutcomeStore, build_label_store
 from .model import build_model
 from .runtime import (
     DedupLedger,
@@ -47,7 +55,7 @@ from .runtime import (
     guard_config,
     run_lock,
 )
-from .train import load_checkpoint, train
+from .train import checkpoint_info, load_checkpoint, train
 
 DEFAULT_CONFIG = "configs/toy.yaml"
 
@@ -97,16 +105,24 @@ def _load(args: argparse.Namespace) -> Config:
 def _datasets(cfg: Config):
     if cfg.data.source == "synthetic":
         return make_synthetic_dataset(cfg)
-    if cfg.data.source == "pages":
+    if cfg.data.source in ("pages", "deepmath"):
         if not cfg.data.page_dir:
-            raise CliError("data.source=pages requires data.page_dir")
+            raise CliError(f"data.source={cfg.data.source} requires data.page_dir")
         page_dir = Path(cfg.data.page_dir)
         if not (page_dir / "index.json").exists():
             raise CliError(
                 f"no extracted pages at {page_dir} (missing index.json); "
                 "run 'aimo extract' first, or point data.page_dir at an existing page directory"
             )
-        return load_dataset(page_dir)
+        datasets = load_dataset(page_dir)
+        if cfg.data.label_path:
+            label_path = Path(cfg.data.label_path)
+            if not label_path.exists():
+                raise CliError(
+                    f"label store not found: {label_path}; run 'aimo build-labels' first"
+                )
+            attach_labels(datasets, LabelStore.load(label_path))
+        return datasets
     raise CliError(f"unknown data.source {cfg.data.source!r}")
 
 
@@ -134,9 +150,12 @@ def _emit(payload: dict) -> int:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
+    from .adapters.deepmath import probe_deepmath
     from .adapters.mathgap import probe_mathgap
-    from .adapters.qwen import probe_qwen
+    from .adapters.qwen import probe_qwen, thinking_ready
+    from .data import DATA_SCHEMA_VERSION
     from .page import Page
+    from .train import CHECKPOINT_SCHEMA_VERSION, _label_coverage
 
     cfg = _load(args)
     datasets = _datasets(cfg)
@@ -168,7 +187,19 @@ def cmd_check(args: argparse.Namespace) -> int:
             "hash": stats.hash(),
             "inactive_target_cells": int((~stats.target_active).sum()),
         },
-        "adapters": {"mathgap": probe_mathgap(), "qwen": probe_qwen()},
+        "adapters": {
+            "mathgap": probe_mathgap(),
+            "qwen": probe_qwen(),
+            "deepmath": probe_deepmath(),
+        },
+        "task": cfg.train.task,
+        "select_metric": cfg.train.resolved_select_metric(),
+        "schema": {
+            "page_store": DATA_SCHEMA_VERSION,
+            "checkpoint": CHECKPOINT_SCHEMA_VERSION,
+        },
+        "label_coverage": _label_coverage(train_set),
+        "thinking_profile": thinking_ready(cfg.server.thinking),
     }
     return _emit(payload)
 
@@ -235,34 +266,55 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         raise CliError(f"checkpoint not found: {ckpt}")
     model, stats, payload = load_checkpoint(ckpt)
     splits = args.splits or ["validation", "known_test", "unseen_perturbation_test", "harder_test"]
+    task = cfg.train.task
+    want_behavior = cfg.eval.behavior and hasattr(model, "forward_behavior")
+    want_flow = task in ("flow", "joint") and not args.behavior_only
     results = {}
+    behavior_results = {}
     for split in splits:
         if split not in datasets:
             raise CliError(f"unknown split {split!r}")
-        results[split] = evaluate_dataset(
-            model,
-            datasets[split],
-            stats,
-            horizons=tuple(cfg.eval.horizons),
-            bootstrap_samples=cfg.eval.bootstrap_samples,
-            support_swap=cfg.eval.support_swap,
-            seed=cfg.run.seed,
-        )
+        if want_flow:
+            results[split] = evaluate_dataset(
+                model,
+                datasets[split],
+                stats,
+                horizons=tuple(cfg.eval.horizons),
+                bootstrap_samples=cfg.eval.bootstrap_samples,
+                support_swap=cfg.eval.support_swap,
+                seed=cfg.run.seed,
+            )
+        if want_behavior:
+            behavior_results[split] = evaluate_behavior(
+                model,
+                datasets[split],
+                stats,
+                bootstrap_samples=cfg.eval.bootstrap_samples,
+                seed=cfg.run.seed,
+                support_swap=cfg.eval.support_swap,
+                microbatch=max(cfg.train.microbatch_originals, 1),
+            )
     summary = {
         "status": "ok",
         "run_id": cfg.run.run_id,
         "model": cfg.model.name,
+        "task": task,
         "seed": cfg.run.seed,
         "checkpoint": str(ckpt),
+        "checkpoint_info": checkpoint_info(payload),
         "checkpoint_epoch": payload["epoch"],
         "best_epoch": payload["best_epoch"],
         "params": model.param_report().as_dict(),
         "hashes": payload["hashes"],
         "splits": results,
+        "behavior": behavior_results,
         "caveats": [
+            "prediction residual을 non-robust probability로 쓰지 않습니다.",
             "큰 prediction error가 곧 non-robust를 뜻하지 않습니다.",
             "4/4 성공은 population robustness 인증이 아닙니다.",
             "unseen perturbation과 harder 일반화는 각각 따로 봅니다.",
+            "panel 재정렬 불변성은 pair 정보 사용 여부의 ablation이 아닙니다.",
+            "특정 label을 잘 맞혔다고 수학적 구조나 인과성을 발견한 것은 아닙니다.",
         ],
     }
     out = Path(args.out) if args.out else cfg.run_dir / "eval_summary.json"
@@ -284,9 +336,17 @@ def _compare_runs(run_dirs: list[str], out: str | None) -> int:
             "seed": payload.get("seed"),
             "params": payload["params"],
         }
-        for split, result in payload["splits"].items():
+        row["task"] = payload.get("task")
+        for split, result in payload.get("splits", {}).items():
             for metric, summary in result["metrics"].items():
-                row[f"{split}/{metric}"] = summary["mean"]
+                row[f"flow/{split}/{metric}"] = summary["mean"]
+        for split, result in payload.get("behavior", {}).items():
+            for metric, summary in result["metrics"].items():
+                row[f"behavior/{split}/{metric}"] = summary["mean"]
+            classification = result.get("robust_classification", {})
+            for key in ("accuracy", "balanced_accuracy", "auroc", "brier"):
+                if key in classification:
+                    row[f"behavior/{split}/{key}"] = classification[key]
         rows.append(row)
     comparison = {
         "status": "ok",
@@ -348,8 +408,9 @@ def cmd_predict(args: argparse.Namespace) -> int:
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
+    from .adapters.deepmath import probe_deepmath
     from .adapters.mathgap import probe_mathgap
-    from .adapters.qwen import probe_qwen, screening_ready
+    from .adapters.qwen import probe_qwen, screening_ready, thinking_ready
 
     cfg = _load(args)
     run_dir = cfg.run_dir
@@ -370,7 +431,15 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     qwen = probe_qwen()
     if not qwen.get("qwen3_ready"):
         pending.append("transformers>=4.51 for Qwen3 is not available")
-    pending.append("real Qwen3-4B screening and numerical audit")
+    deepmath = probe_deepmath()
+    if not cfg.server.deepmath.revision:
+        pending.append("server.deepmath.revision (pinned snapshot) is not set")
+    if not cfg.server.deepmath.local_path and not deepmath["available"]:
+        pending.append("DeepMath snapshot is not available locally")
+    thinking = thinking_ready(cfg.server.thinking)
+    for name in thinking["needs_calibration"]:
+        pending.append(f"thinking profile needs calibration: {name}")
+    pending.append("real Qwen3-4B behavior measurement and numerical audit")
     payload = {
         "status": "ok",
         "dry_run": True,
@@ -390,7 +459,9 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             "block_minutes": cfg.server.gpu_block_minutes,
             "stop_minutes": cfg.server.gpu_stop_minutes,
         },
-        "screening_plan": {
+        "thinking_profile": thinking,
+        "gpu_full_run_allowed": not thinking["needs_calibration"],
+        "legacy_screening_plan": {
             "thinking": cfg.server.screening.thinking,
             "temperature": cfg.server.screening.temperature,
             "top_p": cfg.server.screening.top_p,
@@ -398,9 +469,16 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             "min_p": cfg.server.screening.min_p,
             "max_new_tokens": cfg.server.screening.max_new_tokens,
             "slots_per_prompt": cfg.server.screening.slots_per_prompt,
-            "note": "연구용 screening 설정이며 공식 AIMO 평가 정책이 아닙니다.",
+            "note": "legacy non-thinking 설정입니다. 새 DeepMath 경로에서 쓰지 않습니다.",
         },
-        "adapters": {"mathgap": mathgap, "qwen": qwen, "screening": screening_ready()},
+        "adapters": {
+            "mathgap": mathgap,
+            "qwen": qwen,
+            "deepmath": deepmath,
+            "screening": screening_ready(),
+        },
+        "task": cfg.train.task,
+        "select_metric": cfg.train.resolved_select_metric(),
         "server_pending": pending,
     }
     return _emit(payload)
@@ -412,20 +490,83 @@ def cmd_preflight(args: argparse.Namespace) -> int:
 
 
 def cmd_prepare_data(args: argparse.Namespace) -> int:
+    """데이터 후보와 split을 준비합니다.
+
+    data.source=deepmath 는 DeepMath primary 경로, pages/synthetic 은 legacy MathGAP
+    경로입니다. 실제 대규모 다운로드는 서버에서만 합니다.
+    """
     from .adapters import AdapterUnavailable
-    from .adapters.mathgap import MathGapAdapter
 
     cfg = _load(args)
+    if cfg.data.source == "deepmath":
+        from .adapters.deepmath import (
+            DATASET_ID,
+            assign_splits,
+            load_local_rows,
+            probe_deepmath,
+            select_candidates,
+        )
+
+        local = args.input or cfg.server.deepmath.local_path
+        if not local:
+            probe = probe_deepmath()
+            raise CliError(
+                f"{DATASET_ID} snapshot이 필요합니다. --input으로 local JSONL/parquet를 주거나 "
+                "server.deepmath.local_path를 설정하세요. 전체 dataset 다운로드는 서버에서만 "
+                f"합니다 (SERVER_PENDING, probe={probe['status']})"
+            )
+        try:
+            rows = load_local_rows(local, revision=cfg.server.deepmath.revision or "local")
+        except AdapterUnavailable as exc:
+            raise CliError(str(exc)) from exc
+        report = select_candidates(
+            rows,
+            max_originals=cfg.server.deepmath.max_candidate_originals,
+            allowed_topics=tuple(cfg.server.deepmath.allowed_topics),
+            require_topic=cfg.server.deepmath.require_topic,
+        )
+        splits = assign_splits(report.candidates, seed=cfg.run.seed)
+        out = Path(args.out) if args.out else cfg.run_dir / "deepmath_candidates.json"
+        atomic_write_json(
+            out,
+            {
+                "dataset_id": DATASET_ID,
+                "revision": cfg.server.deepmath.revision,
+                "candidates": [row.as_metadata() for row in report.candidates],
+                "splits": {name: [row.row_id for row in rows] for name, rows in splits.items()},
+            },
+        )
+        return _emit(
+            {
+                "status": "ok",
+                "source": "deepmath",
+                "written": str(out),
+                "selection": report.as_dict(),
+                "split_sizes": {name: len(rows) for name, rows in splits.items()},
+                "notes": [
+                    "후보 수이지 확보된 labeled pair 수가 아닙니다.",
+                    "topic/difficulty는 curator metadata이며 predictor input이 아닙니다.",
+                    "r1_solution은 predictor 입력·prompt·label 생성에 쓰지 않습니다.",
+                    "DeepMath difficulty를 MATH Level 1~5와 같은 척도로 보지 않습니다.",
+                    "같은 original과 그 variants/seeds는 한 split에만 둡니다.",
+                ],
+            }
+        )
+
+    from .adapters.mathgap import MathGapAdapter
+
     try:
         adapter = MathGapAdapter.from_config(cfg.server.mathgap)
     except AdapterUnavailable as exc:
         raise CliError(str(exc)) from exc
-    payload = {
-        "status": "ok",
-        "revision": adapter.revision,
-        "note": "generator/renderer/oracle 경로가 확인된 경우에만 여기까지 옵니다.",
-    }
-    return _emit(payload)
+    return _emit(
+        {
+            "status": "ok",
+            "source": "mathgap_legacy",
+            "revision": adapter.revision,
+            "note": "MathGAP/GSM은 구현·저난도 대조용 legacy 경로입니다.",
+        }
+    )
 
 
 def cmd_screen(args: argparse.Namespace) -> int:
@@ -511,6 +652,205 @@ def cmd_extract(args: argparse.Namespace) -> int:
     return _emit(payload)
 
 
+def cmd_import_pairs(args: argparse.Namespace) -> int:
+    """검증된 original-variant pair를 읽어 freeze합니다."""
+    from .adapters import AdapterUnavailable
+    from .adapters.perturbation import FrozenPairStore, import_verified_pairs
+
+    cfg = _load(args)
+    source = args.input or cfg.data.pair_path
+    if not source:
+        raise CliError("import-pairs needs --input or data.pair_path")
+    try:
+        candidates, report = import_verified_pairs(source)
+    except AdapterUnavailable as exc:
+        raise CliError(str(exc)) from exc
+    store = FrozenPairStore.freeze(candidates)
+    out = Path(args.out) if args.out else cfg.run_dir / "frozen_pairs.json"
+    try:
+        store.save(out, overwrite=args.overwrite)
+    except AdapterUnavailable as exc:
+        raise CliError(str(exc)) from exc
+    return _emit(
+        {
+            "status": "ok",
+            "written": str(out),
+            "import_report": report,
+            "frozen": store.report(),
+            "note": "행동 실행 전에 freeze했습니다. 이후 후보를 바꾸면 hash가 달라집니다.",
+        }
+    )
+
+
+def cmd_collect_outcomes(args: argparse.Namespace) -> int:
+    """행동 측정 결과(outcome counts)를 적재합니다.
+
+    실제 generation은 서버 GPU에서만 합니다. 로컬에서는 서버가 만든 JSONL을 읽어
+    store로 정리하는 것까지만 합니다.
+    """
+    cfg = _load(args)
+    out = Path(args.out) if args.out else cfg.run_dir / "outcomes.json"
+    if not args.from_file:
+        if not args.execute_gpu:
+            raise CliError(
+                "collect-outcomes는 --from-file로 서버 결과를 적재하거나 "
+                "--execute-gpu로 실제 generation을 실행해야 합니다"
+            )
+        _budget_gate(cfg)
+        pending = cfg.server.thinking.needs_calibration()
+        if pending:
+            raise CliError(
+                f"thinking profile is not calibrated yet: {pending}; "
+                "fix them in the server calibration manifest before a full GPU run "
+                "(SERVER_PENDING)"
+            )
+        raise CliError(
+            "SERVER_PENDING: real Qwen3-4B behavior measurement runs on the server; "
+            "이 저장소는 로컬에서 실제 답변을 생성하지 않습니다"
+        )
+    store = OutcomeStore.load(out) if out.exists() else OutcomeStore()
+    incoming = OutcomeStore.from_jsonl(args.from_file)
+    try:
+        merge_report = store.merge(incoming, mode=args.merge_mode)
+    except ValueError as exc:
+        raise CliError(str(exc)) from exc
+    store.save(out)
+    return _emit(
+        {
+            "status": "ok",
+            "written": str(out),
+            "merge": merge_report,
+            "store": store.report(),
+            "note": (
+                "exact_continuation과 request_resume는 서로 다른 관측입니다. "
+                "X만 새 독립 generation으로 바꿔 기존 완료 기록과 합치지 않습니다."
+            ),
+        }
+    )
+
+
+def cmd_build_labels(args: argparse.Namespace) -> int:
+    """outcome counts와 freeze된 pair에서 label store를 만듭니다."""
+    from .adapters.perturbation import FrozenPairStore
+
+    cfg = _load(args)
+    outcome_path = Path(args.outcomes or cfg.data.outcome_path or cfg.run_dir / "outcomes.json")
+    pair_path = Path(args.pairs or cfg.data.pair_path or cfg.run_dir / "frozen_pairs.json")
+    for path, name in ((outcome_path, "outcomes"), (pair_path, "frozen pairs")):
+        if not path.exists():
+            raise CliError(f"{name} store not found: {path}")
+    outcomes = OutcomeStore.load(outcome_path)
+    pairs = FrozenPairStore.load(pair_path)
+    policy = BinaryRobustPolicy(
+        enabled=cfg.data.robust_policy.enabled,
+        definition_id=cfg.data.robust_policy.definition_id,
+        source=cfg.data.robust_policy.source,
+    )
+    try:
+        store = build_label_store(outcomes, pairs.candidates, robust_policy=policy)
+    except ValueError as exc:
+        raise CliError(str(exc)) from exc
+    out = Path(args.out) if args.out else cfg.run_dir / "labels.json"
+    store.save(out)
+    report = store.coverage_report()
+    return _emit(
+        {
+            "status": "ok",
+            "written": str(out),
+            "coverage": report,
+            "robust_policy": {
+                "enabled": policy.enabled,
+                "definition_id": policy.definition_id,
+                "source": policy.source,
+            },
+            "notes": [
+                "C4 필터를 적용하지 않았습니다. 성공/실패/유지/개선 사례를 모두 보존합니다.",
+                "미확정 pair는 behavior loss에서 제외되지만 flow에는 쓸 수 있습니다.",
+                "robust label은 frozen definition이 있을 때만 채워집니다.",
+            ],
+        }
+    )
+
+
+def cmd_predict_behavior(args: argparse.Namespace) -> int:
+    """checkpoint로 pair drop과 panel robust probability를 예측합니다."""
+    cfg = _load(args)
+    datasets = _datasets(cfg)
+    ckpt = Path(args.checkpoint) if args.checkpoint else cfg.run_dir / "best.pt"
+    if not ckpt.exists():
+        raise CliError(f"checkpoint not found: {ckpt}")
+    model, stats, payload = load_checkpoint(ckpt)
+    if not hasattr(model, "forward_behavior"):
+        raise CliError(
+            f"checkpoint model {payload.get('model_name')!r} has no behavior head; "
+            "train a behavior or joint task first"
+        )
+    dataset = datasets[args.split]
+    groups = dataset.groups[: max(args.n_originals, 1)]
+    batch = collate_panels(groups)
+    with torch.no_grad():
+        out = model.forward_behavior(batch.inputs, stats)
+        panel = model.panel_outputs(out, batch.pair_panel, batch.pair_slot, batch.panel_mask)
+    trained = model.trained_heads() if hasattr(model, "trained_heads") else {}
+    panels = []
+    for b, group in enumerate(groups):
+        members = []
+        for slot, variant_id in enumerate(batch.variant_ids[b]):
+            members.append(
+                {
+                    "variant_id": variant_id,
+                    "pair_drop_hat": float(panel.pair_drop[b, slot]),
+                    "pair_drop_label": (
+                        float(batch.drop_target[b, slot])
+                        if bool(batch.drop_mask[b, slot])
+                        else None
+                    ),
+                    "pooling_weight": float(panel.pooling_weights[b, slot]),
+                }
+            )
+        panels.append(
+            {
+                "original_id": group.original_id,
+                "panel_id": group.panel_id,
+                "robust_probability": float(panel.robust_prob[b]),
+                "robust_label": (
+                    int(batch.robust_target[b]) if bool(batch.robust_mask[b]) else None
+                ),
+                "panel_max_drop_hat": float(panel.max_drop[b]),
+                "members": members,
+            }
+        )
+    payload_out = {
+        "status": "ok",
+        "split": args.split,
+        "checkpoint": str(ckpt),
+        "checkpoint_info": checkpoint_info(payload),
+        "trained_heads": trained,
+        "untrained_heads": [name for name, ok in trained.items() if not ok],
+        "panels": panels,
+        "caveats": [
+            "prediction residual은 robustness 지표가 아닙니다.",
+            "학습되지 않은 head의 출력은 검증된 robust probability가 아닙니다.",
+            "pair score와 pooling weight는 개별 변형의 causal importance가 아닙니다.",
+        ],
+    }
+    if trained and not trained.get("robust", False):
+        payload_out["warning"] = (
+            "the robust head was never trained on a real label; robust_probability values "
+            "come from an untrained head"
+        )
+    if args.out:
+        atomic_write_json(args.out, payload_out)
+        payload_out["written"] = args.out
+    return _emit(payload_out)
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """같은 config로 train을 이어서 실행합니다."""
+    args.resume = True
+    return cmd_train(args)
+
+
 def cmd_run_stage1(args: argparse.Namespace) -> int:
     cfg = _load(args)
     stages = args.stages or ["prepare-data", "screen", "extract", "train"]
@@ -573,16 +913,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_toy.add_argument("--out", default=None, help="출력 directory")
     p_toy.set_defaults(func=cmd_make_toy)
 
-    p_train = sub.add_parser("train", help="Stage 1 predictor 학습")
+    p_train = sub.add_parser("train", help="behavior / flow / joint 학습")
     common(p_train)
     p_train.add_argument("--resume", action="store_true", help="last.pt에서 이어서 학습")
     p_train.set_defaults(func=cmd_train)
+
+    p_resume = sub.add_parser("resume", help="같은 config로 train 이어서 실행")
+    common(p_resume)
+    p_resume.set_defaults(func=cmd_resume, resume=True)
 
     p_eval = sub.add_parser("evaluate", help="checkpoint 평가 또는 run 비교")
     common(p_eval)
     p_eval.add_argument("--checkpoint", default=None)
     p_eval.add_argument("--splits", nargs="*", default=None)
     p_eval.add_argument("--compare", nargs="*", default=None, help="비교할 run directory 목록")
+    p_eval.add_argument("--behavior-only", action="store_true", help="flow 지표를 생략합니다")
     p_eval.add_argument("--out", default=None)
     p_eval.set_defaults(func=cmd_evaluate)
 
@@ -594,15 +939,53 @@ def build_parser() -> argparse.ArgumentParser:
     p_pred.add_argument("--out", default=None)
     p_pred.set_defaults(func=cmd_predict)
 
+    p_predb = sub.add_parser("predict-behavior", help="pair drop / panel robust probability 예측")
+    common(p_predb)
+    p_predb.add_argument("--checkpoint", default=None)
+    p_predb.add_argument("--split", default="known_test")
+    p_predb.add_argument("--n-originals", type=int, default=3)
+    p_predb.add_argument("--out", default=None)
+    p_predb.set_defaults(func=cmd_predict_behavior)
+
     p_pre = sub.add_parser("preflight", help="서버 실행 전 dry-run")
     common(p_pre)
     p_pre.set_defaults(func=cmd_preflight)
 
-    p_prep = sub.add_parser("prepare-data", help="MathGAP 자료 준비")
+    p_prep = sub.add_parser("prepare-data", help="DeepMath 후보/split 준비 (legacy: MathGAP)")
     common(p_prep)
+    p_prep.add_argument("--input", default=None, help="local DeepMath JSONL/parquet snapshot")
+    p_prep.add_argument("--out", default=None)
     p_prep.set_defaults(func=cmd_prepare_data)
 
-    p_screen = sub.add_parser("screen", help="실제 screening (--execute-gpu 필요)")
+    p_pairs = sub.add_parser("import-pairs", help="검증된 original-variant pair import 후 freeze")
+    common(p_pairs)
+    p_pairs.add_argument("--input", default=None, help="검증된 pair JSONL")
+    p_pairs.add_argument("--out", default=None)
+    p_pairs.add_argument(
+        "--overwrite", action="store_true", help="freeze된 후보를 의도적으로 다시 freeze"
+    )
+    p_pairs.set_defaults(func=cmd_import_pairs)
+
+    p_outcomes = sub.add_parser("collect-outcomes", help="행동 측정 결과(outcome counts) 적재")
+    common(p_outcomes)
+    p_outcomes.add_argument("--from-file", default=None, help="서버가 만든 outcome JSONL")
+    p_outcomes.add_argument(
+        "--merge-mode",
+        default="new_only",
+        choices=list(OutcomeStore.MERGE_MODES),
+        help="기존 기록과의 병합 방식",
+    )
+    p_outcomes.add_argument("--out", default=None)
+    p_outcomes.set_defaults(func=cmd_collect_outcomes)
+
+    p_labels = sub.add_parser("build-labels", help="outcome counts -> pair drop / panel label")
+    common(p_labels)
+    p_labels.add_argument("--outcomes", default=None)
+    p_labels.add_argument("--pairs", default=None)
+    p_labels.add_argument("--out", default=None)
+    p_labels.set_defaults(func=cmd_build_labels)
+
+    p_screen = sub.add_parser("screen", help="legacy screening (--execute-gpu 필요)")
     common(p_screen)
     p_screen.set_defaults(func=cmd_screen)
 
@@ -615,7 +998,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_extract.add_argument("--out", default=None)
     p_extract.set_defaults(func=cmd_extract)
 
-    p_stage1 = sub.add_parser("run-stage1", help="Stage 1 단계 순서 실행")
+    p_stage1 = sub.add_parser("run-stage1", help="legacy flow 경로 단계 실행")
     common(p_stage1)
     p_stage1.add_argument("--stages", nargs="*", default=None)
     p_stage1.add_argument("--resume", action="store_true")

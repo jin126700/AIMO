@@ -1,3 +1,5 @@
+# legacy (v1 flow-only): screened-stable pair의 flow 학습.
+# v2 primary는 configs/behavior.yaml 입니다.
 # Stage 1: screened-stable original-variant pair의 update 흐름 학습 (E2).
 # Page는 서버에서 추출한 npz directory에서 읽습니다. shape는 자료가 결정합니다.
 run:

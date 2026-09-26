@@ -70,7 +70,7 @@ def test_reference_rows_never_read_observed_or_query_cells(datasets):
     layout = build_layout(n_blocks=4, n_landmarks=3, cut=2, use_variant_prefix=True,
                           device=torch.device("cpu"))
     valid = torch.ones(1, 3, dtype=torch.bool)
-    blocked = build_attention_mask(layout, valid)[0]
+    blocked = build_attention_mask(layout, valid[:, layout.landmark])[0]
     allowed = ~blocked
     ref_rows = layout.kind == KIND_REF
     non_ref_cols = layout.kind != KIND_REF
@@ -95,7 +95,7 @@ def test_reference_rows_never_read_observed_or_query_cells(datasets):
 def test_padding_landmarks_do_not_create_all_masked_rows(datasets):
     layout = build_layout(4, 3, 2, True, torch.device("cpu"))
     valid = torch.tensor([[True, False, False]])
-    blocked = build_attention_mask(layout, valid)
+    blocked = build_attention_mask(layout, valid[:, layout.landmark])
     assert bool((~blocked).any(dim=-1).all()), "모든 row에 최소 하나의 key가 열려 있어야 합니다"
 
 
