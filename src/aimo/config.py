@@ -57,11 +57,39 @@ def allowed_select_metrics(task: str) -> tuple[str, ...]:
 
 
 @dataclass
+class SeedConfig:
+    """역할별 seed. None이면 `run.seed`(master)에서 채웁니다.
+
+    `train`만 바꾸면 자료·split·label이 그대로 유지되어야 합니다. 그래서 data/split은
+    학습 초기화나 sampler와 분리되어 있습니다.
+    """
+
+    data: int | None = None  # synthetic Page 내용
+    split: int | None = None  # split 배정
+    train: int | None = None  # model 초기화와 dropout
+    sampler: int | None = None  # batch/cut sampling
+    eval: int | None = None  # bootstrap 등 평가 난수
+
+    def resolved(self, master: int) -> dict[str, int]:
+        return {
+            "data": master if self.data is None else self.data,
+            "split": master if self.split is None else self.split,
+            "train": master if self.train is None else self.train,
+            "sampler": master if self.sampler is None else self.sampler,
+            "eval": master if self.eval is None else self.eval,
+        }
+
+
+@dataclass
 class RunConfig:
     run_id: str = "toy_e0"
-    seed: int = 0
+    seed: int = 0  # master seed. seeds의 빈 항목을 채웁니다.
+    seeds: SeedConfig = field(default_factory=SeedConfig)
     device: str = "cpu"  # 로컬은 cpu 고정. GPU 실행은 CLI의 --execute-gpu가 필요합니다.
     notes: str = ""
+
+    def resolved_seeds(self) -> dict[str, int]:
+        return self.seeds.resolved(self.seed)
 
 
 @dataclass
@@ -272,7 +300,13 @@ class DeepMathConfig:
 
     dataset_id: str = "zwhe99/DeepMath-103K"
     revision: str | None = None  # pinned snapshot revision. 없으면 SERVER_PENDING.
+    # 서버의 dataset 기본 경로. 로컬에서 존재 여부를 확인하거나 만들지 않습니다.
+    dataset_root: str = "/data1/Data/AIMO/Datasets"
     local_path: str | None = None  # local JSONL/parquet snapshot
+    # 이미 준비된 registry directory (inputs/answers/metadata/pairs/splits).
+    prepared_dir: str | None = None
+    # parquet을 한 번에 펼치지 않고 batch 단위로 읽습니다.
+    parquet_batch_size: int = 512
     max_candidate_originals: int = 300  # 후보 수이지 확보된 labeled pair 수가 아닙니다.
     require_topic: bool = True
     allowed_topics: tuple[str, ...] = (

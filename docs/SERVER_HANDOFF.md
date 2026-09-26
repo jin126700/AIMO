@@ -25,6 +25,7 @@ generation, GPU 실험을 하지 않습니다. GPU 실행은 CLI에서 `--execut
 | PyYAML | 6.0.1 |
 | pytest | 9.0.3 |
 | ruff | 0.16.9 |
+| pyarrow | 25.0.1 (optional, parquet batch 읽기 검증에만 사용) |
 | transformers | 4.39.1 (optional. Qwen3에는 부족 -> Qwen2 tiny config로 hook 논리만 검증) |
 
 서버에서 추가로 필요한 것:
@@ -47,10 +48,13 @@ pip install -e ".[server]"    # 서버 전용 optional 의존성
 예시 경로는 `configs/server.example.yaml`에 있습니다.
 
 ```
-repo:   /data1/HKM/AIMO
-input:  /data1/HKM/data
-output: /data1/HKM/result/AIMO/HKM/aimo_v2/<run_id>
+repo:    /data1/HKM/AIMO
+dataset: /data1/Data/AIMO/Datasets
+output:  /data1/HKM/result/AIMO/HKM/aimo_v2/<run_id>/
 ```
+
+이 경로는 config와 example 문서에만 반영했습니다. 로컬에서 존재 여부를 확인하거나 만들지
+않았습니다.
 
 경로는 전부 config로 관리합니다. 코드에는 개인 경로를 하드코딩하지 않습니다. 실제 값은
 Git에서 제외되는 `configs/server.yaml`로 복사해 채웁니다 (`.gitignore` 참고).
@@ -73,11 +77,15 @@ aimo import-pairs --config configs/server.yaml --input <verified_pairs.jsonl>
 # 3) 작은 calibration으로 policy/scorer/budget 확정 (E1c)
 #    runtime, VRAM, 완료율, 원본 정답률, label uncertainty를 확인하고
 #    configs/server.yaml의 server.thinking에 확정값을 기록합니다.
-aimo collect-outcomes --config configs/server.yaml --execute-gpu   # calibration subset
+#    --plans로 slot 계획을 주고 backend를 고릅니다 (mock은 경로 검증 전용).
+aimo collect-outcomes --config configs/server.yaml --plans <plans.jsonl> \
+  --backend qwen --execute-gpu
 
 # 4) 반복 행동 측정 결과를 적재하고 label을 만듭니다
 aimo collect-outcomes --config configs/server.yaml --from-file <outcomes.jsonl> \
   --merge-mode new_only
+# 미시작 slot만 채울 때: --merge-mode fill_not_started
+# 독립 재실행을 보존할 때: --merge-mode separate_cohort --cohort rerun1
 aimo build-labels --config configs/server.yaml
 
 # 5) Page extraction
@@ -107,6 +115,7 @@ calibration으로 runtime·VRAM·완료율·원본 정답률·label uncertainty�
 | `config.json` | 이 run에 고정된 config와 config hash |
 | `run.lock` | 실행 중 lock (정상 종료 시 삭제) |
 | `extract_ledger.jsonl` | extraction dedup/resume용 완료 key |
+| `slot_ledger.jsonl` | collection slot dedup/resume용 완료 key와 outcome |
 | `deepmath_candidates.json` | 후보 metadata와 split 배정 |
 | `frozen_pairs.json` | freeze된 original-variant 후보 (hash 포함) |
 | `outcomes.json` | prompt별 outcome counts |
@@ -133,10 +142,20 @@ step 사이에서만 중단을 판단하며, **다른 사용자의 process나 co
 없습니다**. 이 동작은 로컬 CPU에서 mock worker로 검증했습니다
 (`tests/test_runtime.py::test_gpu_budget_stops_at_the_hard_limit_and_blocks_new_work`).
 
-서버 단계는 두 부분을 씁니다. `GpuBudget.can_start()`는 CLI의 GPU 경로
-(`screen`, `--execute-gpu` extract)에서 새 작업 시작을 막는 gate이고,
-`run_budgeted(step_fn, budget, max_steps)`는 step 단위 작업을 예산 안에서 돌리는
-wrapper입니다. 실제 GPU worker를 `step_fn`으로 넘기면 됩니다.
+서버 단계는 세 부분을 씁니다.
+
+- `GpuBudget.can_start()`: CLI의 GPU 경로에서 새 작업 시작을 막는 gate
+- `BudgetGuard`: training / collection / extraction runner에 연결하는 context manager.
+  **예외·중단 시에도 elapsed를 저장**하고(`finally`), `should_stop()`으로 긴 작업 도중
+  중단 요청과 hard stop을 알리며, `terminate_owned()`로 **소유한 subprocess만** 종료합니다
+- `run_budgeted(step_fn, budget, max_steps, stop=...)`: step 단위 작업 wrapper
+
+step 사이 검사만으로 hard stop을 보장하지 않습니다. 작업 쪽에서 `should_stop()`을 충분히
+자주 polling해야 합니다. 단계나 resume가 누적 예산을 리셋하지 않습니다.
+
+`preflight`는 선택한 task와 `data.source`에 필요한 항목만 blocker로 봅니다. DeepMath 경로에
+MathGAP 설정을 요구하지 않고, `gpu_full_run_allowed`는 calibration뿐 아니라 snapshot과
+transformers 조건까지 함께 봅니다 (`gpu_blockers`로 이유를 나열합니다).
 
 ## 7. SERVER_PENDING 목록과 미확정 protocol
 

@@ -95,24 +95,53 @@ class PageDataset:
         return PageDataset(split=self.split, groups=self.groups[:n_keep])
 
     def data_hash(self) -> str:
-        """split 구성과 label 존재 여부를 함께 해싱해 label mismatch도 잡습니다."""
+        """split 구성, **Page 내용**, label 값을 모두 해싱합니다.
+
+        ID 목록만으로는 같은 ID에 다른 Page나 다른 label이 들어와도 구분할 수 없으므로
+        content fingerprint를 함께 씁니다.
+        """
         payload = []
         for group in self.groups:
             panel = group.panel_label
+            labels = []
+            for variant in group.variants:
+                label = group.pair_labels.get(variant.variant_id)
+                labels.append(
+                    None
+                    if label is None
+                    else {
+                        "drop": label.signed_drop,
+                        "lower": label.drop_lower,
+                        "upper": label.drop_upper,
+                        "semantic": label.semantic_valid,
+                        "policy": label.policy_hash,
+                        "scorer": label.scorer_version,
+                        "excluded": label.exclusion_reason,
+                    }
+                )
             payload.append(
                 {
                     "original_id": group.original_id,
+                    "panel_id": group.panel_id,
+                    "pages": [group.original.content_fingerprint()]
+                    + [v.content_fingerprint() for v in group.variants],
                     "variants": [v.variant_id for v in group.variants],
-                    "drops": [
-                        group.pair_labels[v.variant_id].signed_drop
-                        if v.variant_id in group.pair_labels
-                        else None
-                        for v in group.variants
-                    ],
+                    "labels": labels,
                     "robust": None if panel is None else panel.robust_label,
                     "max_drop": None if panel is None else panel.max_drop,
+                    "coverage": None
+                    if panel is None
+                    else sorted(panel.coverage.expected_members),
                 }
             )
+        blob = json.dumps([self.split, payload], sort_keys=True).encode()
+        return hashlib.sha256(blob).hexdigest()[:16]
+
+    def split_structure_hash(self) -> str:
+        """Page 내용을 제외한 split 구성(ID)만의 hash. 진단용입니다."""
+        payload = [
+            [g.original_id] + [v.variant_id for v in g.variants] for g in self.groups
+        ]
         blob = json.dumps([self.split, payload], sort_keys=True).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
 
@@ -140,6 +169,21 @@ class FlowInput:
     @property
     def n_blocks(self) -> int:
         return int(self.orig_updates.shape[1])
+
+    def to(self, device: torch.device) -> FlowInput:
+        """microbatch만 device로 옮깁니다 (전체 dataset을 올리지 않습니다)."""
+        if self.orig_state.device == device:
+            return self
+        return FlowInput(
+            cut=self.cut,
+            orig_state=self.orig_state.to(device, non_blocking=True),
+            orig_updates=self.orig_updates.to(device, non_blocking=True),
+            var_state_prefix=self.var_state_prefix.to(device, non_blocking=True),
+            var_updates_prefix=self.var_updates_prefix.to(device, non_blocking=True),
+            valid=self.valid.to(device, non_blocking=True),
+            relative_positions=self.relative_positions.to(device, non_blocking=True),
+            token_offsets=self.token_offsets.to(device, non_blocking=True),
+        )
 
 
 # 하위 호환 이름. 기존 코드와 test는 PredictorInput을 그대로 쓸 수 있습니다.
@@ -174,6 +218,24 @@ class BehaviorInput:
     def n_blocks(self) -> int:
         return int(self.orig_updates.shape[1])
 
+    def to(self, device: torch.device) -> BehaviorInput:
+        """microbatch만 device로 옮깁니다."""
+        if self.orig_state.device == device:
+            return self
+        move = lambda t: t.to(device, non_blocking=True)  # noqa: E731
+        return BehaviorInput(
+            orig_state=move(self.orig_state),
+            orig_updates=move(self.orig_updates),
+            var_state=move(self.var_state),
+            var_updates=move(self.var_updates),
+            orig_valid=move(self.orig_valid),
+            var_valid=move(self.var_valid),
+            orig_relative_positions=move(self.orig_relative_positions),
+            var_relative_positions=move(self.var_relative_positions),
+            orig_token_offsets=move(self.orig_token_offsets),
+            var_token_offsets=move(self.var_token_offsets),
+        )
+
 
 @dataclass
 class PanelBatch:
@@ -206,6 +268,27 @@ class PanelBatch:
     def max_members(self) -> int:
         return int(self.panel_mask.shape[1])
 
+    def to(self, device: torch.device) -> PanelBatch:
+        """microbatch만 device로 옮깁니다."""
+        if self.panel_mask.device == device:
+            return self
+        move = lambda t: t.to(device, non_blocking=True)  # noqa: E731
+        return PanelBatch(
+            inputs=self.inputs.to(device),
+            pair_panel=move(self.pair_panel),
+            pair_slot=move(self.pair_slot),
+            panel_mask=move(self.panel_mask),
+            drop_target=move(self.drop_target),
+            drop_mask=move(self.drop_mask),
+            robust_target=move(self.robust_target),
+            robust_mask=move(self.robust_mask),
+            max_drop_target=move(self.max_drop_target),
+            max_drop_mask=move(self.max_drop_mask),
+            max_drop_available=move(self.max_drop_available),
+            original_ids=self.original_ids,
+            variant_ids=self.variant_ids,
+        )
+
 
 @dataclass
 class PairBatch:
@@ -230,6 +313,34 @@ class PairBatch:
     original_ids: list[str]
     variant_ids_a: list[str]
     variant_ids_b: list[str]
+
+    @property
+    def valid_dtype(self) -> torch.dtype:
+        """loss 누적에 쓰는 float dtype (Page와 같은 dtype)."""
+        return self.target_a.dtype
+
+    def to(self, device: torch.device) -> PairBatch:
+        """microbatch만 device로 옮깁니다."""
+        if self.valid.device == device:
+            return self
+        move = lambda t: t.to(device, non_blocking=True)  # noqa: E731
+        return PairBatch(
+            cut=self.cut,
+            input_a=self.input_a.to(device),
+            input_b=self.input_b.to(device),
+            target_a=move(self.target_a),
+            target_b=move(self.target_b),
+            future_state_diff_a=move(self.future_state_diff_a),
+            future_state_diff_b=move(self.future_state_diff_b),
+            var_state_a=move(self.var_state_a),
+            var_state_b=move(self.var_state_b),
+            valid=move(self.valid),
+            has_sibling=move(self.has_sibling),
+            is_identity_a=move(self.is_identity_a),
+            original_ids=self.original_ids,
+            variant_ids_a=self.variant_ids_a,
+            variant_ids_b=self.variant_ids_b,
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -576,10 +687,15 @@ def make_synthetic_split(
 
 
 def make_synthetic_dataset(cfg: Config) -> dict[str, PageDataset]:
-    """E0용 5개 split을 만듭니다. 같은 original의 variants는 같은 split에 둡니다."""
+    """synthetic split 5개를 만듭니다. 같은 original의 variants는 같은 split에 둡니다.
+
+    자료 내용은 `run.seeds.data`, split 배정은 `run.seeds.split`만 씁니다. 학습 초기화
+    seed(`run.seeds.train`)를 바꿔도 자료와 label은 그대로입니다.
+    """
     syn = cfg.data.synthetic
     dyn = _shared_dynamics(syn, torch.Generator().manual_seed(12345))
-    base = cfg.run.seed
+    seeds = cfg.run.resolved_seeds()
+    base = seeds["data"] + 1000 * seeds["split"]
     delta, harder = syn.delta_scale, syn.harder_delta_scale
     plan = [
         ("train", syn.n_originals_train, base + 1, delta, 0),
@@ -680,15 +796,66 @@ def load_dataset(directory: str | Path) -> dict[str, PageDataset]:
     return datasets
 
 
-def attach_labels(datasets: dict[str, PageDataset], store: LabelStore) -> dict:
+# Page provenance에서 label policy 대응을 확인할 때 보는 key.
+PAGE_POLICY_KEYS = ("policy_hash", "model_hash", "tokenizer_hash", "config_hash")
+SYNTHETIC_SOURCE = "synthetic"
+
+
+def page_policy_identity(page: Page) -> dict[str, str]:
+    """Page provenance에서 실행 policy 식별 정보를 뽑습니다."""
+    provenance = page.provenance or {}
+    return {key: str(provenance.get(key, "")) for key in PAGE_POLICY_KEYS}
+
+
+def check_page_label_policy(page: Page, label_policy_hash: str) -> None:
+    """Page의 실제 model/tokenizer/template/prompt policy가 label과 대응하는지 검사합니다.
+
+    **빈 hash를 동일성의 근거로 쓰지 않습니다.** 한쪽이라도 비어 있으면 대응을 확인할 수
+    없는 것으로 보고 거부합니다. 단, provenance의 source가 명시적으로 synthetic인 fixture는
+    별도로 허용합니다.
+    """
+    provenance = page.provenance or {}
+    identity = page_policy_identity(page)
+    if provenance.get("source") == SYNTHETIC_SOURCE:
+        # synthetic fixture는 명시적 provenance로 허용합니다.
+        page_policy = identity["policy_hash"]
+        if label_policy_hash and page_policy and page_policy != label_policy_hash:
+            raise ValueError(
+                f"synthetic page {page.variant_id!r} policy_hash {page_policy!r} does not match "
+                f"the label policy {label_policy_hash!r}"
+            )
+        return
+    missing = [key for key, value in identity.items() if not value]
+    if missing:
+        raise ValueError(
+            f"page {page.variant_id!r} is missing provenance {missing}; an empty hash is not "
+            "evidence that the page and the label come from the same run"
+        )
+    if not label_policy_hash:
+        raise ValueError(
+            f"label for {page.variant_id!r} has an empty policy_hash; refusing to treat it as "
+            "matching the page provenance"
+        )
+    if identity["policy_hash"] != label_policy_hash:
+        raise ValueError(
+            f"page {page.variant_id!r} was produced under policy "
+            f"{identity['policy_hash']!r} but the label was measured under "
+            f"{label_policy_hash!r}; do not attach labels across policies"
+        )
+
+
+def attach_labels(
+    datasets: dict[str, PageDataset], store: LabelStore, *, check_provenance: bool = True
+) -> dict:
     """LabelStore의 label을 group에 붙입니다.
 
-    서로 다른 model/thinking/sampling policy를 섞지 않도록 policy hash를 확인하고,
-    붙지 않은 label 수와 coverage를 보고합니다. missing label은 None으로 남깁니다.
+    label 내부 policy 일치만 보지 않고, 실제 Page provenance(model/tokenizer/template/
+    prompt/policy)와의 대응까지 검사합니다. missing label은 None으로 남깁니다.
     """
     check_policy_consistency(store)
     attached_pairs = 0
     attached_panels = 0
+    checked_pages = 0
     for dataset in datasets.values():
         for group in dataset.groups:
             for variant in group.variants:
@@ -700,11 +867,18 @@ def attach_labels(datasets: dict[str, PageDataset], store: LabelStore) -> dict:
                         f"label for {variant.variant_id} belongs to original "
                         f"{label.original_id!r}, not {group.original_id!r}"
                     )
+                if check_provenance:
+                    check_page_label_policy(variant, label.policy_hash)
+                    check_page_label_policy(group.original, label.policy_hash)
+                    checked_pages += 2
                 group.pair_labels[variant.variant_id] = label
                 group.panel_id = group.panel_id or label.panel_id
                 attached_pairs += 1
             panel = store.panels.get(group.original_id)
             if panel is not None:
+                if check_provenance and panel.policy_hash:
+                    check_page_label_policy(group.original, panel.policy_hash)
+                    checked_pages += 1
                 group.panel_label = panel
                 group.panel_id = group.panel_id or panel.panel_id
                 attached_panels += 1
@@ -713,6 +887,7 @@ def attach_labels(datasets: dict[str, PageDataset], store: LabelStore) -> dict:
         "attached_panels": attached_panels,
         "unmatched_pairs": len(store.pairs) - attached_pairs,
         "unmatched_panels": len(store.panels) - attached_panels,
+        "provenance_checked_pages": checked_pages,
         **store.coverage_report(),
     }
 
@@ -779,13 +954,28 @@ class NormStats:
         """[..., P, H] / rollout_scale[depth]."""
         return diff / self._safe(self.rollout_scale[depth])
 
+    def to(self, device: torch.device) -> NormStats:
+        """scale tensor만 옮깁니다 (작은 tensor라 복제 비용이 적습니다)."""
+        if self.input_state_scale.device == device:
+            return self
+        return NormStats(
+            input_state_scale=self.input_state_scale.to(device),
+            input_update_scale=self.input_update_scale.to(device),
+            target_scale=self.target_scale.to(device),
+            sibling_scale=self.sibling_scale.to(device),
+            rollout_scale=self.rollout_scale.to(device),
+            floor=self.floor,
+            source=self.source,
+            n_originals=self.n_originals,
+        )
+
     def state_dict(self) -> dict:
         return {
-            "input_state_scale": self.input_state_scale,
-            "input_update_scale": self.input_update_scale,
-            "target_scale": self.target_scale,
-            "sibling_scale": self.sibling_scale,
-            "rollout_scale": self.rollout_scale,
+            "input_state_scale": self.input_state_scale.cpu(),
+            "input_update_scale": self.input_update_scale.cpu(),
+            "target_scale": self.target_scale.cpu(),
+            "sibling_scale": self.sibling_scale.cpu(),
+            "rollout_scale": self.rollout_scale.cpu(),
             "floor": self.floor,
             "source": self.source,
             "n_originals": self.n_originals,
@@ -805,8 +995,9 @@ class NormStats:
         )
 
     def hash(self) -> str:
+        # hashing은 항상 CPU에서 합니다 (device가 hash를 바꾸지 않도록).
         blob = b"".join(
-            t.numpy().tobytes()
+            t.detach().cpu().numpy().tobytes()
             for t in (
                 self.input_state_scale,
                 self.input_update_scale,

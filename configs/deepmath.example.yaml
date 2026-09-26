@@ -7,7 +7,9 @@ run:
   notes: "DeepMath candidate selection and split freeze"
 
 paths:
-  input_root: /data1/HKM/data
+  # dataset 기본 경로. 로컬에서 존재 여부를 확인하거나 만들지 않습니다.
+  input_root: /data1/Data/AIMO/Datasets
+  # result는 <output_root>/<run_id>/ 아래에 남습니다.
   output_root: /data1/HKM/result/AIMO/HKM/aimo_v2
 
 data:
@@ -39,7 +41,12 @@ server:
     dataset_id: zwhe99/DeepMath-103K
     # SERVER_PENDING: 확인한 snapshot revision을 채웁니다. 추측해서 넣지 않습니다.
     revision: null
-    local_path: /data1/HKM/data/deepmath/deepmath-103k.parquet
+    dataset_root: /data1/Data/AIMO/Datasets
+    local_path: /data1/Data/AIMO/Datasets/deepmath/deepmath-103k.parquet
+    # 이미 준비된 registry directory. 있으면 frozen split을 그대로 씁니다.
+    prepared_dir: /data1/Data/AIMO/Datasets/deepmath/prepared
+    # parquet을 한 번에 펼치지 않고 batch 단위로 읽습니다.
+    parquet_batch_size: 512
     max_candidate_originals: 300   # 후보 수이지 확보된 labeled pair 수가 아닙니다
     require_topic: true
     allowed_topics: ["algebra", "number theory", "combinatorics", "discrete", "geometry"]

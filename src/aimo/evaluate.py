@@ -28,7 +28,7 @@ from .data import (
     swap_panel_support,
     swap_support,
 )
-from .losses import HUBER_DELTA, target_cell_mask
+from .losses import HUBER_DELTA, huber_elementwise, target_cell_mask
 from .rollout import rollout
 
 
@@ -261,36 +261,37 @@ def _auroc(scores: list[float], labels: list[int]) -> float | None:
     if not pos or not neg:
         return None
     values = torch.tensor(scores, dtype=torch.float64)
-    order = values.argsort()
-    ranks = torch.empty_like(values)
-    ranks[order] = torch.arange(1, len(values) + 1, dtype=torch.float64)
-    # 동점은 평균 rank로 처리합니다.
-    unique = values.unique()
-    for value in unique.tolist():
-        mask = values == value
-        if int(mask.sum()) > 1:
-            ranks[mask] = ranks[mask].mean()
+    ranks = _average_rank(values)  # 동점은 average rank
     label_t = torch.tensor(labels, dtype=torch.float64)
     sum_pos_ranks = float(ranks[label_t == 1].sum())
     n_pos, n_neg = len(pos), len(neg)
     return (sum_pos_ranks - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
 
 
+def _average_rank(values: torch.Tensor) -> torch.Tensor:
+    """동점을 average rank로 처리한 순위."""
+    order = values.argsort()
+    ranks = torch.empty_like(values)
+    ranks[order] = torch.arange(1, len(values) + 1, dtype=values.dtype)
+    for value in values.unique():
+        tie = values == value
+        if int(tie.sum()) > 1:
+            ranks[tie] = ranks[tie].mean()
+    return ranks
+
+
 def _spearman(a: list[float], b: list[float]) -> float | None:
-    """작은 panel 안의 순위 상관. 값이 2개 미만이거나 한쪽이 상수면 undefined입니다."""
+    """작은 panel 안의 순위 상관. 동점은 average rank로 처리합니다.
+
+    값이 2개 미만이거나 한쪽이 상수이면 undefined(None)입니다.
+    """
     if len(a) < 2:
         return None
     ta, tb = torch.tensor(a, dtype=torch.float64), torch.tensor(b, dtype=torch.float64)
     if float(ta.std()) == 0.0 or float(tb.std()) == 0.0:
         return None
 
-    def rank(t: torch.Tensor) -> torch.Tensor:
-        order = t.argsort()
-        out = torch.empty_like(t)
-        out[order] = torch.arange(1, len(t) + 1, dtype=torch.float64)
-        return out
-
-    ra, rb = rank(ta), rank(tb)
+    ra, rb = _average_rank(ta), _average_rank(tb)
     ra, rb = ra - ra.mean(), rb - rb.mean()
     denom = float((ra.pow(2).sum() * rb.pow(2).sum()).sqrt())
     if denom == 0.0:
@@ -387,9 +388,11 @@ def evaluate_behavior(
                 target = float(batch.drop_target[b, slot])
                 predicted = float(pred[b, slot])
                 acc["pair_drop_mae"].add(group_id, abs(predicted - target))
-                diff = abs(predicted - target)
-                huber = (
-                    0.5 * diff**2 / HUBER_DELTA if diff < HUBER_DELTA else diff - 0.5 * HUBER_DELTA
+                # training과 **같은** Huber helper와 delta를 씁니다.
+                huber = float(
+                    huber_elementwise(
+                        torch.tensor(predicted), torch.tensor(target), HUBER_DELTA
+                    )
                 )
                 acc["pair_drop_huber"].add(group_id, huber)
                 true_vals.append(target)
@@ -446,26 +449,43 @@ def evaluate_behavior(
             permutation_shift = max(permutation_shift, float(shift))
 
         # pair support-swap: target variant를 고정하고 sibling의 Page를 대입합니다.
+        # slot 0만 보지 않고 **모든 유효 target variant**를 평가하며, 원문별로 평균한 뒤
+        # 원문 단위 동일 가중치로 집계합니다.
         if support_swap:
-            swapped = swap_panel_support(batch, target_slot=0)
-            swapped_out = model.forward_behavior(swapped.inputs, stats)
-            swapped_panel = model.panel_outputs(
-                swapped_out, swapped.pair_panel, swapped.pair_slot, swapped.panel_mask
-            )
-            for b, group in enumerate(chunk):
-                if int(batch.panel_mask[b].sum()) < 2 or not bool(batch.drop_mask[b, 0]):
+            per_group_shift: dict[str, list[float]] = {}
+            per_group_increase: dict[str, list[float]] = {}
+            for slot in range(batch.max_members):
+                if not bool(batch.drop_mask[:, slot].any()):
+                    continue
+                swapped = swap_panel_support(batch, target_slot=slot)
+                swapped_out = model.forward_behavior(swapped.inputs, stats)
+                swapped_panel = model.panel_outputs(
+                    swapped_out, swapped.pair_panel, swapped.pair_slot, swapped.panel_mask
+                )
+                for b, group in enumerate(chunk):
+                    if int(batch.panel_mask[b].sum()) < 2 or not bool(batch.drop_mask[b, slot]):
+                        continue
+                    target = float(batch.drop_target[b, slot])
+                    correct = float(pred[b, slot])
+                    swapped_value = float(swapped_panel.pair_drop[b, slot])
+                    per_group_shift.setdefault(group.original_id, []).append(
+                        abs(swapped_value - correct)
+                    )
+                    per_group_increase.setdefault(group.original_id, []).append(
+                        abs(swapped_value - target) - abs(correct - target)
+                    )
+            for group in chunk:
+                values = per_group_shift.get(group.original_id)
+                if not values:
                     acc["pair_support_swap_drop_shift"].skip()
                     acc["pair_support_swap_mae_increase"].skip()
                     continue
-                target = float(batch.drop_target[b, 0])
-                correct = float(pred[b, 0])
-                swapped_value = float(swapped_panel.pair_drop[b, 0])
                 acc["pair_support_swap_drop_shift"].add(
-                    group.original_id, abs(swapped_value - correct)
+                    group.original_id, sum(values) / len(values)
                 )
+                increases = per_group_increase[group.original_id]
                 acc["pair_support_swap_mae_increase"].add(
-                    group.original_id,
-                    abs(swapped_value - target) - abs(correct - target),
+                    group.original_id, sum(increases) / len(increases)
                 )
 
     trained = model.trained_heads() if hasattr(model, "trained_heads") else {}
@@ -480,7 +500,7 @@ def evaluate_behavior(
             name: a.summary(bootstrap_samples=bootstrap_samples, seed=seed)
             for name, a in acc.items()
         },
-        "robust_classification": _classification_metrics(probs, labels),
+        "robust_classification": None,
         "panel_permutation_max_prob_shift": permutation_shift,
         "notes": [
             "집계 단위는 original panel입니다. layer/variant를 독립 문제로 세지 않습니다.",
@@ -489,12 +509,18 @@ def evaluate_behavior(
             "학습되지 않은 head의 출력은 검증된 robust probability가 아닙니다.",
         ],
     }
-    if trained and not trained.get("robust", False):
-        results["robust_classification"]["untrained_head"] = True
-        results["robust_classification"]["warning"] = (
-            "robust head was never trained on a real label; these numbers are from an "
-            "untrained head"
-        )
+    classification = _classification_metrics(probs, labels)
     if labels and len(set(labels)) == 1:
-        results["robust_classification"]["single_class_only"] = True
+        classification["single_class_only"] = True
+    if trained and not trained.get("robust", False):
+        # 학습되지 않은 head의 원시 score는 canonical 결과로 내보내지 않습니다.
+        results["robust_classification"] = None
+        results["robust_head_status"] = "untrained"
+        results["debug_untrained_robust_classification"] = classification
+    else:
+        results["robust_classification"] = classification
+        results["robust_head_status"] = "trained" if trained.get("robust") else "unknown"
+    # pair-derived max-drop은 별도 학습 head가 아니라 학습된 pair 예측에서 계산한
+    # diagnostic입니다.
+    results["max_drop_source"] = "derived_from_pair_predictions"
     return results

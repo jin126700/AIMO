@@ -4,7 +4,8 @@ AIMO 저장소에서 작업할 때의 공통 지침입니다. 상세 내용은
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
 [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md),
 [docs/DATA_PROTOCOL.md](docs/DATA_PROTOCOL.md),
-[docs/SERVER_HANDOFF.md](docs/SERVER_HANDOFF.md)에 있습니다.
+[docs/SERVER_HANDOFF.md](docs/SERVER_HANDOFF.md),
+[docs/FIXES.md](docs/FIXES.md)에 있습니다.
 
 ## 0. 현재 확정된 결정 (v2)
 
@@ -77,7 +78,22 @@ native vectors
 - label mask는 loss routing에만 씁니다. **missing label을 0이나 False로 바꾸지 않습니다.
   label 0은 실제 label입니다.**
 - original-panel label을 모든 variant의 pair label로 복사하지 않습니다.
-- cap-hit(X) / U_score / infra_error / not_started를 W로 합치지 않습니다.
+- cap-hit(X) / U_score / infra_error / not_started를 W로 합치지 않습니다. 채점 불가와 명확한
+  오답을 구분하고, 지원 범위를 벗어난 표현은 `U_score`입니다 (임의 eval 금지).
+- outcome counts는 음이 아닌 정수이고 합이 `planned_trials`와 같아야 합니다. 미기록 slot은
+  명시적 import 규칙으로만 `not_started`로 채웁니다. `N=0`의 확률·bounds는 undefined입니다.
+- 완료된 slot을 새 독립 generation으로 대체하지 않습니다. 미시작 slot만 채우거나
+  (`fill_not_started`) 별도 cohort로 보존합니다 (`separate_cohort`). exact continuation은
+  slot 단위 trajectory 증거가 있어야 합니다.
+- loss 항은 합 + count로 모으고 effective batch의 global denominator로 한 번만 나눕니다.
+  서로 다른 항의 valid count를 합치지 않습니다. training과 evaluation은 같은 Huber helper를
+  씁니다.
+- seed는 data / split / train / sampler / eval로 분리합니다. train seed를 바꿔도
+  data/split/label hash는 같아야 합니다.
+- data hash는 ID 목록이 아니라 Page 내용 fingerprint와 label 값을 포함합니다.
+- `run.device`가 실제 model/batch/NormStats에 적용됩니다. 전체 dataset을 올리지 않고
+  microbatch만 옮기며, CUDA가 없으면 명시적 오류입니다.
+- 예산은 예외·중단 시에도 elapsed를 저장하고, 소유한 subprocess만 종료합니다.
 - 서로 다른 model / thinking mode / sampling policy의 label을 섞지 않습니다.
 - joint에서 두 view의 gradient는 같은 core에 누적됩니다. shared parameter를 optimizer에
   중복 등록하지 않고, flow gradient를 detach하지 않습니다.

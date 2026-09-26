@@ -137,12 +137,31 @@ def test_preflight_does_not_load_weights(tmp_path, capsys):
     assert payload["loaded_model_weights"] is False
     assert payload["gpu_budget"]["can_start"] is True
     assert payload["legacy_screening_plan"]["slots_per_prompt"] == 4
-    assert any("Qwen3-4B" in item for item in payload["server_pending"])
     # v2 thinking profile과 calibration 상태를 함께 보고합니다.
     assert payload["thinking_profile"]["enable_thinking"] is True
     assert payload["thinking_profile"]["status"] == "SERVER_PENDING"
-    assert payload["gpu_full_run_allowed"] is False
-    assert any("needs calibration" in item for item in payload["server_pending"])
+    # synthetic source에는 DeepMath/MathGAP/calibration이 blocker가 아닙니다.
+    assert payload["checked_for"]["data_source"] == "synthetic"
+    assert payload["gpu_blockers"] == []
+    assert not any("mathgap" in item for item in payload["server_pending"])
+
+
+def test_preflight_is_task_specific(tmp_path, capsys):
+    """선택한 task/데이터 경로에 필요한 항목만 blocker로 봅니다."""
+    config = write_config(tmp_path)
+    deepmath = run(
+        capsys, "preflight", "--config", config, "--set", "data.source=deepmath",
+        "--set", f"data.page_dir={tmp_path}", "--run-id", "pf_dm",
+    )
+    assert deepmath["gpu_full_run_allowed"] is False
+    assert any("deepmath.revision" in item for item in deepmath["server_pending"])
+    assert any("needs calibration" in item for item in deepmath["server_pending"])
+    mathgap = run(
+        capsys, "preflight", "--config", config, "--set", "data.source=mathgap",
+        "--run-id", "pf_mg",
+    )
+    assert any("mathgap" in item for item in mathgap["server_pending"])
+    assert not any("deepmath.revision" in item for item in mathgap["server_pending"])
 
 
 def test_extract_tiny_runs_on_cpu(tmp_path, capsys):
@@ -161,7 +180,8 @@ def test_extract_tiny_runs_on_cpu(tmp_path, capsys):
         "24",
     )
     assert payload["real_weights"] is False
-    assert payload["skipped"] is False
+    assert payload["extraction"]["extracted"] == 1
+    assert payload["extraction"]["skipped"] == 0
     assert payload["residual_identity_max_error"] < 1e-4
     assert payload["state_shape"] == [3, 17, 16]
     assert payload["n_extracted_total"] == 1
@@ -172,10 +192,10 @@ def test_extract_dedup_skips_a_repeated_prompt(tmp_path, capsys):
     config = write_config(tmp_path)
     argv = ["extract", "--config", config, "--tiny", "--hidden-size", "16", "--layers", "2"]
     first = run(capsys, *argv)
-    assert first["skipped"] is False
+    assert first["extraction"]["extracted"] == 1
     second = run(capsys, *argv)  # 같은 prompt는 ledger로 건너뜁니다.
-    assert second["skipped"] is True
-    assert "dedup ledger" in second["reason"]
+    assert second["extraction"]["extracted"] == 0
+    assert second["extraction"]["skipped"] == 1
 
 
 def test_gpu_budget_blocks_a_real_extract(tmp_path, capsys):
@@ -391,7 +411,7 @@ def test_prepare_data_deepmath_with_local_snapshot(tmp_path, capsys):
 def test_check_reports_task_and_schema(tmp_path, capsys):
     payload = run(capsys, "check", "--config", write_config(tmp_path))
     assert payload["schema"]["page_store"].endswith("v2")
-    assert payload["schema"]["checkpoint"].endswith("v2")
+    assert payload["schema"]["checkpoint"].endswith("v3")
     assert payload["task"] == "flow"  # config 기본값
     assert payload["adapters"]["deepmath"]["status"] == "SERVER_PENDING"
     assert payload["label_coverage"]["n_pairs"] > 0

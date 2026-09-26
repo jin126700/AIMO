@@ -156,27 +156,51 @@ def validate_row(raw: dict, row_index: int, revision: str = "unknown") -> DeepMa
     )
 
 
-def load_local_rows(path: str | Path, revision: str = "local") -> list[DeepMathRow]:
-    """local JSONL 또는 parquet snapshot을 읽습니다 (네트워크를 쓰지 않습니다)."""
+# 실제로 읽는 column만 요청합니다. r1 풀이는 존재 개수만 세고 본문을 보관하지 않습니다.
+NEEDED_COLUMNS = ("row_id", "id", *REQUIRED_FIELDS, *OPTIONAL_FIELDS)
+
+
+def load_local_rows(
+    path: str | Path, revision: str = "local", batch_size: int = 512
+) -> list[DeepMathRow]:
+    """local JSONL 또는 parquet snapshot을 읽습니다 (네트워크를 쓰지 않습니다).
+
+    parquet은 전체를 `to_pylist`로 펼치지 않고 **필요한 column만 batch 단위로** 읽습니다.
+    r1 풀이 본문은 즉시 버리고 개수만 남깁니다.
+    """
     path = Path(path)
     if not path.exists():
         raise AdapterUnavailable(f"DeepMath local snapshot not found: {path}")
+    rows: list[DeepMathRow] = []
     if path.suffix == ".jsonl":
-        lines = path.read_text(encoding="utf-8").splitlines()
-        raw_rows = [json.loads(line) for line in lines if line.strip()]
-    elif path.suffix == ".parquet":
-        try:
-            pyarrow = importlib.import_module("pyarrow.parquet")
-        except ImportError as exc:
-            raise AdapterUnavailable(
-                f"{SERVER_PENDING}: reading parquet needs pyarrow (server extra)"
-            ) from exc
-        raw_rows = pyarrow.read_table(path).to_pylist()
-    else:
+        for index, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
+            if line.strip():
+                rows.append(validate_row(json.loads(line), index, revision))
+        return rows
+    if path.suffix != ".parquet":
         raise AdapterUnavailable(
             f"unsupported DeepMath snapshot format {path.suffix!r}; use .jsonl or .parquet"
         )
-    return [validate_row(raw, i, revision) for i, raw in enumerate(raw_rows)]
+    try:
+        pq = importlib.import_module("pyarrow.parquet")
+    except ImportError as exc:
+        raise AdapterUnavailable(
+            f"{SERVER_PENDING}: reading parquet needs pyarrow (server extra)"
+        ) from exc
+    handle = pq.ParquetFile(path)
+    available = set(handle.schema_arrow.names)
+    columns = [name for name in NEEDED_COLUMNS if name in available]
+    missing = [name for name in REQUIRED_FIELDS if name not in available]
+    if missing:
+        raise AdapterUnavailable(
+            f"parquet {path} is missing required column(s) {missing}; found {sorted(available)}"
+        )
+    index = 0
+    for batch in handle.iter_batches(batch_size=batch_size, columns=columns):
+        for raw in batch.to_pylist():
+            rows.append(validate_row(raw, index, revision))
+            index += 1
+    return rows
 
 
 def looks_self_contained(question: str) -> tuple[bool, str | None]:
@@ -270,10 +294,102 @@ def benchmark_overlap(
     }
 
 
+PREPARED_FILES = {
+    "registry": "registry.json",
+    "inputs": "inputs.jsonl",
+    "answers": "answers.jsonl",
+    "metadata": "metadata.jsonl",
+    "pairs": "pairs.jsonl",
+    "splits": "splits.json",
+}
+
+
+def load_prepared_registry(root: str | Path, revision: str = "prepared") -> dict:
+    """이미 준비된 registry directory를 직접 읽습니다.
+
+    `inputs/answers/metadata`를 합쳐 row를 만들고, `splits.json`이 있으면 **그 frozen split을
+    그대로 씁니다** (새로 assign_splits로 덮어쓰지 않습니다). `pairs.jsonl`은 그대로 넘겨
+    `import_verified_pairs`가 쓰도록 합니다.
+    """
+    root = Path(root)
+    if not root.exists():
+        raise AdapterUnavailable(f"prepared registry directory not found: {root}")
+    inputs_path = root / PREPARED_FILES["inputs"]
+    if not inputs_path.exists():
+        raise AdapterUnavailable(f"prepared registry is missing {inputs_path.name}")
+
+    def read_jsonl(name: str) -> dict[str, dict]:
+        path = root / PREPARED_FILES[name]
+        if not path.exists():
+            return {}
+        out = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            key = str(record.get("row_id") or record.get("id"))
+            out[key] = record
+        return out
+
+    inputs = read_jsonl("inputs")
+    answers = read_jsonl("answers")
+    metadata = read_jsonl("metadata")
+    rows: list[DeepMathRow] = []
+    for index, (row_id, record) in enumerate(sorted(inputs.items())):
+        merged = {"row_id": row_id, **record}
+        if row_id in answers:
+            merged.setdefault("final_answer", answers[row_id].get("final_answer"))
+        if row_id in metadata:
+            for key in ("difficulty", "topic"):
+                if key in metadata[row_id]:
+                    merged.setdefault(key, metadata[row_id][key])
+        rows.append(validate_row(merged, index, revision))
+    splits_path = root / PREPARED_FILES["splits"]
+    frozen_splits = (
+        json.loads(splits_path.read_text(encoding="utf-8")) if splits_path.exists() else None
+    )
+    pairs_path = root / PREPARED_FILES["pairs"]
+    registry_path = root / PREPARED_FILES["registry"]
+    return {
+        "rows": rows,
+        "frozen_splits": frozen_splits,
+        "pairs_path": str(pairs_path) if pairs_path.exists() else None,
+        "registry": (
+            json.loads(registry_path.read_text(encoding="utf-8"))
+            if registry_path.exists()
+            else {}
+        ),
+        "root": str(root),
+    }
+
+
+def apply_frozen_splits(
+    rows: list[DeepMathRow], frozen: dict[str, list[str]]
+) -> dict[str, list[DeepMathRow]]:
+    """frozen split 배정을 그대로 적용합니다. 새로 생성하지 않습니다."""
+    by_id = {row.row_id: row for row in rows}
+    unknown = set(frozen) - set(SPLIT_NAMES)
+    if unknown:
+        raise ValueError(f"frozen splits contain unknown name(s): {sorted(unknown)}")
+    seen: set[str] = set()
+    out: dict[str, list[DeepMathRow]] = {name: [] for name in SPLIT_NAMES}
+    for name, ids in frozen.items():
+        for row_id in ids:
+            if row_id in seen:
+                raise ValueError(f"row {row_id!r} appears in more than one frozen split")
+            seen.add(row_id)
+            row = by_id.get(str(row_id))
+            if row is None:
+                continue  # 준비된 split에만 있고 현재 row에는 없는 항목은 건너뜁니다.
+            out[name].append(row)
+    return out
+
+
 def assign_splits(
     candidates: list[DeepMathRow],
     ratios: dict[str, float] | None = None,
     seed: int = 0,
+    frozen: dict[str, list[str]] | None = None,
 ) -> dict[str, list[DeepMathRow]]:
     """original 단위로 split을 배정합니다.
 
@@ -281,6 +397,9 @@ def assign_splits(
     harder split은 native difficulty 상위 구간에서 고릅니다. difficulty가 없는 row는
     harder로 추측해 넣지 않습니다.
     """
+    if frozen:
+        # 이미 freeze된 split을 새 배정으로 덮어쓰지 않습니다.
+        return apply_frozen_splits(candidates, frozen)
     weights = ratios or {
         "calibration": 0.05,
         "train": 0.6,

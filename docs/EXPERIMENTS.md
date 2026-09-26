@@ -136,8 +136,9 @@ Qwen adapter는 random-init tiny config로 CPU에서 검증합니다. 실제 4B 
 
 ### Pair drop
 
-- MAE / Huber(delta=0.1)
-- 같은 original 내 variant별 예측 차이(spread)와 순위 상관(Spearman)
+- MAE / Huber(delta=0.1) — training과 evaluation이 같은 helper를 씁니다
+- 같은 original 내 variant별 예측 차이(spread)와 순위 상관(Spearman, 동점은 average rank,
+  한쪽이 상수면 undefined)
 - sampling uncertainty: 저장된 drop bound 폭
 - supervised coverage: 실제 drop label이 있는 pair 비율
 
@@ -163,7 +164,12 @@ error, sibling-difference gain, support-swap degradation.
 - **같은 panel의 variants 순서를 바꾸는 것은 set pooling의 permutation invariance 검사이며
   pair 정보 사용 여부의 강한 ablation이 아닙니다.**
 - **Pair support-swap**은 target variant를 고정한 채 같은 original의 다른 variant Page를
-  대입해 pair-drop 변화를 봅니다. panel 단순 재정렬의 불변성과 구분합니다.
+  대입해 pair-drop 변화를 봅니다. **유효한 모든 target variant**를 평가하고 원문 안에서 평균한
+  뒤 원문 단위 동일 가중치로 집계합니다. panel 단순 재정렬의 불변성과 구분합니다.
+- 학습되지 않은 head의 지표는 canonical 결과로 보고하지 않습니다 (`robust_head_status`가
+  `untrained`이면 `robust_classification`은 null이고 원시 score는 debug 출력에만 있습니다).
+- pair-derived max-drop은 별도 학습 head가 아니라 학습된 pair 예측에서 계산한 diagnostic입니다
+  (`max_drop_source`).
 - 모두 non-robust로 예측해 accuracy가 높아진 것을 성공이라고 하지 않습니다.
 - 새 원문 / 새 perturbation / higher difficulty를 각각 따로 보고합니다.
 - 관측 성능을 causal mechanism이나 전체 AIMO 제출 성능으로 확대하지 않습니다.
@@ -201,14 +207,31 @@ python3 -m venv --system-site-packages .venv
 방식으로 돌리고, data efficiency는 `--set data.subset_fraction=0.25`로 만듭니다. 결과는
 `aimo evaluate --compare runs/e0b_joint runs/e0b_m0 ...`로 한 표에 모읍니다.
 
+seed는 역할별로 분리되어 있으므로 자료를 고정한 채 학습 초기화만 바꿀 수 있습니다.
+
+```bash
+.venv/bin/aimo train --config configs/toy_behavior.yaml --run-id e0b_joint_t1 \
+  --set model.name=joint --set train.task=joint \
+  --set run.seeds.train=1 --set run.seeds.sampler=1
+```
+
+이 경우 `split_hashes`와 `train_subset_hash`가 seed 0과 동일해야 합니다
+(`tests/test_joint_train.py::test_train_seed_does_not_change_data_or_labels`).
+
 label 경로(실자료 기준)는 다음 순서입니다.
 
 ```bash
+# 준비된 registry가 있으면 frozen split을 그대로 씁니다.
+.venv/bin/aimo prepare-data     --config configs/deepmath.example.yaml --prepared <registry_dir>
+# 없으면 pinned snapshot에서 후보를 고릅니다 (parquet은 batch 단위로 읽습니다).
 .venv/bin/aimo prepare-data     --config configs/deepmath.example.yaml --input <snapshot>
 .venv/bin/aimo import-pairs     --config configs/behavior.yaml --input <verified_pairs.jsonl>
+# 서버 결과 적재 (미시작 slot만 채울 때는 --merge-mode fill_not_started)
 .venv/bin/aimo collect-outcomes --config configs/behavior.yaml --from-file <outcomes.jsonl>
 .venv/bin/aimo build-labels     --config configs/behavior.yaml
 ```
+
+검수 수정 내역과 CPU 검증 범위는 [FIXES.md](FIXES.md)에 있습니다.
 
 ## 8. E0b 실행 결과 (로컬 CPU, 실측)
 

@@ -226,6 +226,52 @@ def make_alpha_rename_variant(
     )
 
 
+# 외부 준비 자료의 semantic status를 내부 schema로 옮깁니다. 근거는 evidence에 보존합니다.
+# pending / rejected는 절대 verified로 바꾸지 않습니다.
+EXTERNAL_SEMANTIC_STATUS = {
+    "verified_by_construction": SEMANTIC_VERIFIED,
+    "verified_by_existing_evidence": SEMANTIC_VERIFIED,
+    "verified": SEMANTIC_VERIFIED,
+    "pending": SEMANTIC_UNKNOWN,
+    "pending_verification": SEMANTIC_UNKNOWN,
+    "unknown": SEMANTIC_UNKNOWN,
+    "rejected": SEMANTIC_REJECTED,
+    "invalid": SEMANTIC_REJECTED,
+}
+
+
+def map_external_semantic_status(
+    status: str | None, evidence: list[str]
+) -> tuple[str, list[str], list[str]]:
+    """(internal_status, evidence, reasons)를 돌려줍니다.
+
+    - `verified_by_construction`은 생성 규칙 자체가 근거이므로 그 사실을 evidence에 남깁니다.
+    - `verified_by_existing_evidence`는 실제 evidence 항목이 있어야 verified가 됩니다.
+    - pending / unknown / rejected는 그대로 옮깁니다 (승격하지 않습니다).
+    - 알 수 없는 status는 unknown으로 두고 이유를 남깁니다.
+    """
+    if status is None:
+        return SEMANTIC_UNKNOWN, list(evidence), ["no_external_semantic_status"]
+    key = str(status).strip().lower()
+    internal = EXTERNAL_SEMANTIC_STATUS.get(key)
+    if internal is None:
+        return SEMANTIC_UNKNOWN, list(evidence), [f"unknown_external_status={status!r}"]
+    kept = list(evidence)
+    reasons: list[str] = []
+    if internal == SEMANTIC_VERIFIED:
+        if key == "verified_by_construction":
+            kept = [*kept, "external_status=verified_by_construction"]
+        elif not kept:
+            # 근거가 없으면 verified로 올리지 않습니다.
+            return SEMANTIC_UNKNOWN, kept, ["verified_by_existing_evidence_without_evidence"]
+    elif internal == SEMANTIC_REJECTED:
+        reasons.append(f"external_status={key}")
+    else:
+        reasons.append(f"external_status={key}")
+    return internal, kept, reasons
+
+
+# evidence 요구는 status mapping이 담당합니다 (verified_by_construction은 생성 규칙이 근거).
 REQUIRED_IMPORT_FIELDS = (
     "original_id",
     "variant_id",
@@ -233,7 +279,6 @@ REQUIRED_IMPORT_FIELDS = (
     "variant_text",
     "original_answer",
     "variant_answer",
-    "semantic_validation_evidence",
     "source_revision",
 )
 
@@ -262,16 +307,13 @@ def import_verified_pairs(path: str | Path) -> tuple[list[PairCandidate], dict]:
         usability = raw.get("usability", USABILITY_RESEARCH_ONLY)
         if usability not in USABILITY_STATES:
             raise ValueError(f"row {index}: unknown usability {usability!r}")
-        state = SEMANTIC_UNKNOWN
-        reasons = []
+        external = raw.get("semantic_status", raw.get("semantic_valid"))
+        state, evidence, reasons = map_external_semantic_status(external, evidence)
         if missing:
-            reasons.append(f"missing_fields={missing}")
-        elif raw.get("semantic_valid") == SEMANTIC_REJECTED:
-            state = SEMANTIC_REJECTED
-            reasons.append("marked_rejected_by_source")
-        elif evidence and raw.get("semantic_valid") == SEMANTIC_VERIFIED:
-            state = SEMANTIC_VERIFIED
-        else:
+            # 필수 field가 없으면 어떤 외부 status라도 verified로 올리지 않습니다.
+            state = SEMANTIC_REJECTED if state == SEMANTIC_REJECTED else SEMANTIC_UNKNOWN
+            reasons = [f"missing_fields={missing}", *reasons]
+        if state == SEMANTIC_UNKNOWN and not reasons:
             reasons.append("no_semantic_validation_evidence")
         for reason in reasons:
             report["reasons"][reason] = report["reasons"].get(reason, 0) + 1

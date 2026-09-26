@@ -263,6 +263,10 @@ L_roll     = normalized MSE(D_hat_future, D_future)               # horizon 2 / 
 - 없는 항은 mask-out하고 각 loss의 valid count를 기록합니다. **label 0은 실제 label이며
   missing으로 오인하지 않습니다.**
 - 원문 단위로 같은 가중치를 주고, variants는 group 내부에서 먼저 평균합니다.
+- 각 항은 **합 + count**로 모으고, effective batch 전체의 항별 global denominator로 한 번만
+  나눕니다. 따라서 microbatch 크기가 effective objective와 gradient를 바꾸지 않습니다
+  (서로 다른 항의 valid count를 합치지 않습니다). validation도 같은 방식입니다.
+- Huber는 training과 evaluation이 같은 helper와 `delta = 0.1`을 씁니다.
 - pair drop과 max-drop이 같은 counts에서 파생되면 이중 감독이 되므로 기본은 **pair
   regression만** 켭니다 (`train.use_max_drop: false`). max-drop은 diagnostic으로 보고합니다.
 - robust label이 아직 없으면 pair-drop regression이 실제 behavior supervision입니다.
@@ -289,6 +293,14 @@ Clustering / Gram / cosine / TCAV / contrastive concept loss는 넣지 않습니
 최대 100 epochs, validation patience 15. microbatch와 gradient accumulation을
 지원하며, 한 forward는 하나의 cut만 다룹니다 (cut별로 묶어 sub-forward를 돕니다).
 
+학습 시작 전에 supervision을 확인합니다. 활성화한 behavior objective에 유효 label이 전혀 없거나
+선택한 validation 지표에 유효 label이 없으면 **fail-fast**합니다. 가중치가 0인 항은 objective에
+기여하지 않으므로 학습된 head로 표시하지 않습니다.
+
+`run.device`는 실제 model / batch / NormStats에 적용됩니다. 전체 dataset을 accelerator에
+올리지 않고 microbatch만 옮기며, 요청한 accelerator가 없으면 CPU로 조용히 내려가지 않고
+오류입니다 (실제 CUDA 검증은 SERVER_PENDING).
+
 `task`는 `flow`(legacy/auxiliary) / `behavior` / `joint`(primary) 중 하나입니다. joint에서는
 behavior forward와 flow forward의 gradient가 **같은 LoopedCore**에 누적되고, shared
 parameter는 단일 optimizer에 한 번만 등록됩니다 (`model.parameters()`가 공유 parameter를
@@ -305,8 +317,13 @@ optimizer/RNG state, head 학습 여부를 함께 저장합니다. 같은 config
 
 | version | 값 |
 | --- | --- |
-| checkpoint schema | `aimo-checkpoint-v2` |
+| checkpoint schema | `aimo-checkpoint-v3` |
 | page store schema | `aimo-page-store-v2` |
+| scorer version | `2` |
+
+`aimo-checkpoint-v3`는 역할별 seed(`data`/`split`/`train`/`sampler`/`eval`), 내용까지 반영한
+data hash, Python/NumPy RNG를 포함합니다. version이 없거나 `aimo-checkpoint-v2`인 checkpoint는
+명시적으로 거부합니다. CUDA RNG는 저장하지만 재현성은 SERVER_PENDING입니다.
 
 ## 10. 비교군
 

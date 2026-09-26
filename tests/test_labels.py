@@ -10,6 +10,7 @@ from aimo.labels import (
     OUTCOME_CAP_HIT,
     OUTCOME_CORRECT,
     OUTCOME_INFRA_ERROR,
+    OUTCOME_NOT_STARTED,
     OUTCOME_UNSCORED,
     OUTCOME_WRONG,
     SEMANTIC_UNKNOWN,
@@ -31,6 +32,7 @@ POLICY = "policy-a"
 
 
 def outcome(prompt_id: str, correct: int, wrong: int, **extra) -> PromptOutcome:
+    """counts 합이 planned_trials와 같은 완전한 기록을 만듭니다."""
     counts = {OUTCOME_CORRECT: correct, OUTCOME_WRONG: wrong}
     counts.update(extra)
     planned = sum(counts.values())
@@ -38,9 +40,23 @@ def outcome(prompt_id: str, correct: int, wrong: int, **extra) -> PromptOutcome:
         prompt_id=prompt_id,
         counts=counts,
         planned_trials=planned,
-        completed_trials=planned,
+        completed_trials=planned - counts.get(OUTCOME_NOT_STARTED, 0),
         policy_hash=POLICY,
+        scorer_version="2",
     )
+
+
+def evidence(slot_id: str, seed: int = 0) -> dict:
+    """같은 trajectory 이어받기 증거."""
+    return {
+        slot_id: {
+            "request_id": slot_id,
+            "seed": seed,
+            "prompt_hash": "ph",
+            "policy_hash": POLICY,
+            "token_prefix_hash": "tp",
+        }
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -60,12 +76,67 @@ def test_cap_hit_and_unscored_are_not_merged_into_wrong():
 
 def test_p_hat_only_when_every_planned_trial_is_resolved():
     assert outcome("p", 6, 2).p_hat() == pytest.approx(0.75)
+    # 미기록 slot은 명시적으로 not_started여야 합니다.
     partial = PromptOutcome(
-        prompt_id="p", counts={OUTCOME_CORRECT: 3, OUTCOME_WRONG: 1}, planned_trials=8,
-        completed_trials=4, policy_hash=POLICY,
+        prompt_id="p",
+        counts={OUTCOME_CORRECT: 3, OUTCOME_WRONG: 1, OUTCOME_NOT_STARTED: 4},
+        planned_trials=8,
+        completed_trials=4,
+        policy_hash=POLICY,
     )
     assert not partial.fully_resolved
     assert partial.p_hat() is None
+    assert partial.n_not_started == 4
+
+
+def test_counts_must_sum_to_planned_trials():
+    """기록되지 않은 planned slot은 불완전 입력으로 거부합니다."""
+    with pytest.raises(ValueError, match="must equal planned_trials"):
+        PromptOutcome(
+            prompt_id="p", counts={OUTCOME_CORRECT: 1}, planned_trials=4, completed_trials=1
+        )
+    with pytest.raises(ValueError, match="non-negative"):
+        PromptOutcome(
+            prompt_id="p",
+            counts={OUTCOME_CORRECT: -1, OUTCOME_NOT_STARTED: 2},
+            planned_trials=1,
+            completed_trials=0,
+        )
+    # 명시적 import 규칙으로만 채웁니다.
+    filled = PromptOutcome.from_dict(
+        {"prompt_id": "p", "counts": {"C": 1}, "planned_trials": 4, "completed_trials": 1},
+        fill_missing_as_not_started=True,
+    )
+    assert filled.n_not_started == 3
+
+
+def test_unrecorded_slots_do_not_pin_the_upper_bound():
+    """planned=4, C=1 뿐이면 upper가 0.25로 굳으면 안 됩니다."""
+    record = PromptOutcome(
+        prompt_id="p",
+        counts={OUTCOME_CORRECT: 1, OUTCOME_NOT_STARTED: 3},
+        planned_trials=4,
+        completed_trials=1,
+        policy_hash=POLICY,
+    )
+    lower, upper = record.bounds()
+    assert lower == pytest.approx(0.25)
+    assert upper == pytest.approx(1.0)
+
+
+def test_zero_planned_trials_have_undefined_probability():
+    empty = PromptOutcome(
+        prompt_id="z", counts={}, planned_trials=0, completed_trials=0, policy_hash=POLICY
+    )
+    assert empty.bounds() is None
+    assert empty.p_hat() is None
+
+
+def test_completed_and_resolved_are_different():
+    record = outcome("p", 3, 1, **{OUTCOME_CAP_HIT: 2, OUTCOME_UNSCORED: 2})
+    assert record.completed_trials == 8  # generation이 끝난 slot 수
+    assert record.n_resolved == 4  # 점수가 확정된 slot 수 (C + W)
+    assert record.n_unresolved == 4
 
 
 def test_bounds_are_not_a_confidence_interval():
@@ -258,27 +329,60 @@ def test_new_only_merge_does_not_touch_existing_records():
     store = OutcomeStore()
     store.merge([outcome("a", 8, 0)])
     report = store.merge([outcome("a", 0, 8), outcome("b", 4, 4)], mode="new_only")
-    assert report == {"mode": "new_only", "added": 1, "continued": 0, "replaced": 0, "skipped": 1}
+    assert report["added"] == 1 and report["skipped"] == 1
     assert store.outcomes["a"].n_correct == 8
 
 
-def test_exact_continuation_may_only_fill_unresolved_trials():
+def test_exact_continuation_needs_trajectory_evidence():
+    """counts 단조성만으로 continuation을 인정하지 않습니다."""
     store = OutcomeStore()
-    store.merge([outcome("a", 5, 1, **{OUTCOME_CAP_HIT: 2})])
-    store.merge([outcome("a", 6, 2)], mode="exact_continuation")
-    assert store.outcomes["a"].fully_resolved
-    with pytest.raises(ValueError, match="lost already resolved trials"):
-        store.merge([outcome("a", 1, 1, **{OUTCOME_CAP_HIT: 6})], mode="exact_continuation")
+    aggregate = outcome("a", 5, 1, **{OUTCOME_CAP_HIT: 2})
+    store.merge([aggregate])
+    # 증거가 없는 기존 aggregate record에는 이력을 만들어내지 않습니다.
+    with pytest.raises(ValueError, match="per-slot trajectory evidence"):
+        store.merge([outcome("a", 6, 2)], mode="exact_continuation")
+
+    with_evidence = outcome("b", 5, 1, **{OUTCOME_CAP_HIT: 2})
+    with_evidence.slot_evidence = evidence("b#s0")
+    store2 = OutcomeStore()
+    store2.merge([with_evidence])
+    continued = outcome("b", 6, 2)
+    continued.slot_evidence = evidence("b#s0")
+    store2.merge([continued], mode="exact_continuation")
+    assert store2.outcomes["b"].fully_resolved
+    # seed가 달라지면 같은 trajectory가 아닙니다.
+    other = outcome("b", 7, 1)
+    other.slot_evidence = evidence("b#s0", seed=99)
+    with pytest.raises(ValueError, match="independent re-run"):
+        store2.merge([other], mode="exact_continuation")
 
 
-def test_request_resume_replaces_instead_of_merging():
-    """X만 새 독립 generation으로 바꿔 기존 완료 기록과 합치지 않습니다."""
+def test_fill_not_started_keeps_completed_slots():
+    """미시작 slot만 채우고 기존 X를 새 성공으로 대체하지 않습니다."""
     store = OutcomeStore()
-    store.merge([outcome("a", 5, 1, **{OUTCOME_CAP_HIT: 2})])
-    report = store.merge([outcome("a", 2, 6)], mode="request_resume")
-    assert report["replaced"] == 1
-    assert store.outcomes["a"].n_correct == 2  # 합산이 아니라 교체
-    assert store.outcomes["a"].counts[OUTCOME_CAP_HIT] == 0
+    store.merge([outcome("a", 1, 0, **{OUTCOME_CAP_HIT: 1, OUTCOME_NOT_STARTED: 2})])
+    store.merge([outcome("a", 2, 0)], mode="fill_not_started")
+    record = store.outcomes["a"]
+    assert record.counts[OUTCOME_CORRECT] == 3
+    assert record.counts[OUTCOME_CAP_HIT] == 1  # 기존 cap-hit 유지
+    assert record.n_not_started == 0
+    assert record.planned_trials == 4
+    # 완료된 slot을 다시 채우려 하면 거부합니다.
+    with pytest.raises(ValueError, match="were not_started"):
+        store.merge([outcome("a", 1, 0)], mode="fill_not_started")
+
+
+def test_independent_rerun_goes_to_a_separate_cohort():
+    """독립 재실행은 primary 기록을 바꾸지 않고 별도 cohort로 보존합니다."""
+    store = OutcomeStore()
+    store.merge([outcome("a", 1, 0, **{OUTCOME_CAP_HIT: 3})])
+    report = store.merge([outcome("a", 4, 0)], mode="separate_cohort", cohort="rerun1")
+    assert report["cohort_records"] == 1
+    assert store.outcomes["a"].counts[OUTCOME_CORRECT] == 1  # primary 불변
+    assert store.outcomes["a"].counts[OUTCOME_CAP_HIT] == 3
+    assert store.cohorts["rerun1"]["a"].counts[OUTCOME_CORRECT] == 4
+    with pytest.raises(ValueError, match="needs an explicit cohort name"):
+        store.merge([outcome("b", 1, 0)], mode="separate_cohort")
 
 
 def test_outcome_store_rejects_a_different_policy():
@@ -288,6 +392,22 @@ def test_outcome_store_rejects_a_different_policy():
     other.policy_hash = "policy-b"
     with pytest.raises(ValueError, match="keep one policy per store"):
         store.merge([other])
+
+
+def test_outcome_store_rejects_a_different_scorer_version():
+    """이전 결과를 새 scorer 결과로 덮어쓰지 않습니다."""
+    store = OutcomeStore()
+    store.merge([outcome("a", 8, 0)])
+    other = outcome("b", 8, 0)
+    other.scorer_version = "1"
+    with pytest.raises(ValueError, match="do not overwrite earlier results"):
+        store.merge([other])
+
+
+def test_duplicate_prompt_in_one_batch_is_rejected():
+    store = OutcomeStore()
+    with pytest.raises(ValueError, match="duplicate prompt_id"):
+        store.merge([outcome("a", 8, 0), outcome("a", 4, 4)])
 
 
 def test_label_store_policy_consistency():

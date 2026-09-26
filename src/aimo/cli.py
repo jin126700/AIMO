@@ -48,6 +48,7 @@ from .evaluate import evaluate_behavior, evaluate_dataset
 from .labels import BinaryRobustPolicy, LabelStore, OutcomeStore, build_label_store
 from .model import build_model
 from .runtime import (
+    BudgetGuard,
     DedupLedger,
     GpuBudget,
     GpuBudgetExceeded,
@@ -422,24 +423,39 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         stop_minutes=cfg.server.gpu_stop_minutes,
     )
     can_start, budget_reason = budget.can_start()
+    # 선택한 task/데이터 경로에 **필요한 항목만** blocker로 봅니다.
+    task = cfg.train.task
+    source = cfg.data.source
     pending = []
     mathgap = probe_mathgap()
-    if not cfg.server.mathgap.generator_path:
-        pending.append("mathgap.generator_path is not configured")
-    if not mathgap["available"]:
-        pending.append("mathgap package is not installed")
+    if source == "mathgap":
+        if not cfg.server.mathgap.generator_path:
+            pending.append("mathgap.generator_path is not configured")
+        if not mathgap["available"]:
+            pending.append("mathgap package is not installed")
     qwen = probe_qwen()
-    if not qwen.get("qwen3_ready"):
-        pending.append("transformers>=4.51 for Qwen3 is not available")
     deepmath = probe_deepmath()
-    if not cfg.server.deepmath.revision:
-        pending.append("server.deepmath.revision (pinned snapshot) is not set")
-    if not cfg.server.deepmath.local_path and not deepmath["available"]:
-        pending.append("DeepMath snapshot is not available locally")
+    if source == "deepmath":
+        if not cfg.server.deepmath.revision:
+            pending.append("server.deepmath.revision (pinned snapshot) is not set")
+        if not cfg.server.deepmath.local_path and not deepmath["available"]:
+            pending.append("DeepMath snapshot is not available locally")
+    if source in ("pages", "deepmath") and not cfg.data.label_path:
+        pending.append("data.label_path is not set (run 'aimo build-labels')")
+    needs_generation = source in ("deepmath", "pages")
+    if needs_generation and not qwen.get("qwen3_ready"):
+        pending.append("transformers>=4.51 for Qwen3 is not available")
     thinking = thinking_ready(cfg.server.thinking)
-    for name in thinking["needs_calibration"]:
-        pending.append(f"thinking profile needs calibration: {name}")
-    pending.append("real Qwen3-4B behavior measurement and numerical audit")
+    if needs_generation:
+        for name in thinking["needs_calibration"]:
+            pending.append(f"thinking profile needs calibration: {name}")
+        pending.append("real Qwen3-4B behavior measurement and numerical audit")
+    # GPU 실행 가능 여부는 calibration만이 아니라 task의 실제 필수 조건을 함께 봅니다.
+    gpu_blockers = [
+        item
+        for item in pending
+        if "calibration" in item or "transformers" in item or "snapshot" in item
+    ]
     payload = {
         "status": "ok",
         "dry_run": True,
@@ -460,7 +476,9 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             "stop_minutes": cfg.server.gpu_stop_minutes,
         },
         "thinking_profile": thinking,
-        "gpu_full_run_allowed": not thinking["needs_calibration"],
+        "gpu_full_run_allowed": not gpu_blockers,
+        "gpu_blockers": gpu_blockers,
+        "checked_for": {"task": task, "data_source": source},
         "legacy_screening_plan": {
             "thinking": cfg.server.screening.thinking,
             "temperature": cfg.server.screening.temperature,
@@ -507,6 +525,60 @@ def cmd_prepare_data(args: argparse.Namespace) -> int:
             select_candidates,
         )
 
+        prepared = args.prepared or cfg.server.deepmath.prepared_dir
+        if prepared:
+            # 이미 준비된 registry는 직접 읽고, frozen split을 새로 만들지 않습니다.
+            from .adapters.deepmath import load_prepared_registry
+
+            try:
+                bundle = load_prepared_registry(
+                    prepared, revision=cfg.server.deepmath.revision or "prepared"
+                )
+            except AdapterUnavailable as exc:
+                raise CliError(str(exc)) from exc
+            rows = bundle["rows"]
+            report = select_candidates(
+                rows,
+                max_originals=cfg.server.deepmath.max_candidate_originals,
+                allowed_topics=tuple(cfg.server.deepmath.allowed_topics),
+                require_topic=cfg.server.deepmath.require_topic,
+            )
+            splits = assign_splits(
+                report.candidates, seed=cfg.run.resolved_seeds()["split"],
+                frozen=bundle["frozen_splits"],
+            )
+            out = Path(args.out) if args.out else cfg.run_dir / "deepmath_candidates.json"
+            atomic_write_json(
+                out,
+                {
+                    "dataset_id": DATASET_ID,
+                    "revision": cfg.server.deepmath.revision,
+                    "prepared_dir": bundle["root"],
+                    "used_frozen_splits": bundle["frozen_splits"] is not None,
+                    "pairs_path": bundle["pairs_path"],
+                    "candidates": [row.as_metadata() for row in report.candidates],
+                    "splits": {
+                        name: [row.row_id for row in rows_] for name, rows_ in splits.items()
+                    },
+                },
+            )
+            return _emit(
+                {
+                    "status": "ok",
+                    "source": "deepmath_prepared",
+                    "written": str(out),
+                    "prepared_dir": bundle["root"],
+                    "used_frozen_splits": bundle["frozen_splits"] is not None,
+                    "pairs_path": bundle["pairs_path"],
+                    "selection": report.as_dict(),
+                    "split_sizes": {name: len(v) for name, v in splits.items()},
+                    "notes": [
+                        "준비된 frozen split을 그대로 썼습니다 (새로 배정하지 않았습니다).",
+                        "topic/difficulty는 curator metadata이며 predictor input이 아닙니다.",
+                        "r1_solution은 predictor 입력·prompt·label 생성에 쓰지 않습니다.",
+                    ],
+                }
+            )
         local = args.input or cfg.server.deepmath.local_path
         if not local:
             probe = probe_deepmath()
@@ -516,7 +588,11 @@ def cmd_prepare_data(args: argparse.Namespace) -> int:
                 f"합니다 (SERVER_PENDING, probe={probe['status']})"
             )
         try:
-            rows = load_local_rows(local, revision=cfg.server.deepmath.revision or "local")
+            rows = load_local_rows(
+                local,
+                revision=cfg.server.deepmath.revision or "local",
+                batch_size=cfg.server.deepmath.parquet_batch_size,
+            )
         except AdapterUnavailable as exc:
             raise CliError(str(exc)) from exc
         report = select_candidates(
@@ -525,7 +601,7 @@ def cmd_prepare_data(args: argparse.Namespace) -> int:
             allowed_topics=tuple(cfg.server.deepmath.allowed_topics),
             require_topic=cfg.server.deepmath.require_topic,
         )
-        splits = assign_splits(report.candidates, seed=cfg.run.seed)
+        splits = assign_splits(report.candidates, seed=cfg.run.resolved_seeds()["split"])
         out = Path(args.out) if args.out else cfg.run_dir / "deepmath_candidates.json"
         atomic_write_json(
             out,
@@ -592,62 +668,102 @@ def cmd_screen(args: argparse.Namespace) -> int:
 
 
 def cmd_extract(args: argparse.Namespace) -> int:
+    """Page를 추출합니다. tiny model과 실제 weights가 같은 runner를 씁니다."""
     from .adapters import AdapterUnavailable
-    from .adapters.qwen import build_tiny_qwen, extract_page, select_landmarks
+    from .adapters.qwen import (
+        ExtractionRequest,
+        build_tiny_qwen,
+        load_real_qwen,
+        run_page_extraction,
+        select_landmarks,
+    )
+    from .page import save_pages
 
     cfg = _load(args)
-    if not args.tiny:
+    budget = GpuBudget.open(
+        cfg.run_dir,
+        block_minutes=cfg.server.gpu_block_minutes,
+        stop_minutes=cfg.server.gpu_stop_minutes,
+    )
+    guard = None
+    if args.tiny:
+        try:
+            tiny = build_tiny_qwen(hidden_size=args.hidden_size, n_layers=args.layers)
+        except AdapterUnavailable as exc:
+            raise CliError(str(exc)) from exc
+        model, family, real_weights = tiny.model, tiny.family, False
+    else:
         if not args.execute_gpu:
             raise CliError(
                 "실제 weights 추출은 --execute-gpu가 필요합니다. CPU 검증은 --tiny를 쓰세요"
             )
         _budget_gate(cfg)
-        raise CliError(
-            "SERVER_PENDING: real Qwen3-4B extraction runs on the server; "
-            "이 저장소는 로컬에서 4B weights를 내려받지 않습니다"
-        )
-    try:
-        tiny = build_tiny_qwen(hidden_size=args.hidden_size, n_layers=args.layers)
-    except AdapterUnavailable as exc:
-        raise CliError(str(exc)) from exc
-    from .page import save_pages
+        guard = BudgetGuard(budget)
+        try:
+            model, _tokenizer = load_real_qwen(cfg)
+        except AdapterUnavailable as exc:
+            raise CliError(str(exc)) from exc
+        family, real_weights = cfg.server.model_id, True
 
-    # dedup/resume: 이미 추출한 prompt는 다시 돌리지 않습니다.
-    ledger = DedupLedger.open(cfg.run_dir, name="extract_ledger.jsonl")
-    variant_id = f"tiny-orig#var{args.prompt_len:03d}"
-    out = Path(args.out) if args.out else cfg.run_dir / "tiny_page.npz"
-    if ledger.seen(variant_id) and out.exists():
-        return _emit(
-            {
-                "status": "ok",
-                "mode": "tiny_random_init",
-                "skipped": True,
-                "reason": "already extracted (dedup ledger)",
-                "variant_id": variant_id,
-                "written": str(out),
-            }
-        )
-    torch.manual_seed(cfg.run.seed)
+    torch.manual_seed(cfg.run.resolved_seeds()["data"])
     prompt_len = args.prompt_len
-    input_ids = torch.randint(0, 64, (1, prompt_len))
-    offsets, valid, rel = select_landmarks(list(range(1, prompt_len, 2)), prompt_len)
-    page = extract_page(tiny.model, input_ids, offsets, valid, rel, "tiny-orig", variant_id)
-    save_pages([page], out)
-    ledger.mark(variant_id, {"prompt_len": prompt_len, "family": tiny.family})
+    requests = []
+    for index in range(max(args.n_pages, 1)):
+        input_ids = torch.randint(0, 64, (1, prompt_len))
+        offsets, valid, rel = select_landmarks(list(range(1, prompt_len, 2)), prompt_len)
+        requests.append(
+            ExtractionRequest(
+                original_id="tiny-orig",
+                variant_id=f"tiny-orig#var{prompt_len:03d}_{index:02d}",
+                input_ids=input_ids,
+                landmark_offsets=offsets,
+                valid=valid,
+                relative_positions=rel,
+            )
+        )
+    ledger = DedupLedger.open(cfg.run_dir, name="extract_ledger.jsonl")
+    try:
+        if guard is not None:
+            guard.start()
+        pages, report = run_page_extraction(
+            model,
+            requests,
+            ledger=ledger,
+            guard=guard,
+            provenance={
+                "source": "tiny_random_init" if args.tiny else "qwen",
+                "policy_hash": cfg.server.thinking.protocol_hash(),
+                "model_hash": family,
+                "tokenizer_hash": "tiny-none" if args.tiny else "SERVER_PENDING",
+            },
+        )
+    finally:
+        if guard is not None:
+            guard.commit()
+    out = Path(args.out) if args.out else cfg.run_dir / "tiny_page.npz"
+    if pages:
+        save_pages(pages, out)
     payload = {
-        "status": "ok",
-        "mode": "tiny_random_init",
-        "skipped": False,
-        "family": tiny.family,
-        "real_weights": False,
-        "variant_id": variant_id,
-        "state_shape": list(page.state.shape),
-        "updates_shape": list(page.updates.shape),
-        "n_valid_landmarks": int(page.valid.sum()),
-        "residual_identity_max_error": page.residual_identity_error(),
+        "status": "ok" if not report["stopped"] else "stopped",
+        "mode": "tiny_random_init" if args.tiny else "real_weights",
+        "family": family,
+        "real_weights": real_weights,
+        "extraction": report,
+        "n_pages": len(pages),
+        "state_shape": list(pages[0].state.shape) if pages else None,
+        "updates_shape": list(pages[0].updates.shape) if pages else None,
+        "n_valid_landmarks": int(pages[0].valid.sum()) if pages else None,
+        "residual_identity_max_error": (
+            max(page.residual_identity_error() for page in pages) if pages else None
+        ),
         "n_extracted_total": len(ledger),
-        "written": str(out),
-        "note": "random-init tiny config 검증입니다. 실제 Qwen3-4B 추출은 SERVER_PENDING입니다.",
+        "written": str(out) if pages else None,
+        "skipped": report["skipped"],
+        "note": (
+            "random-init tiny config 검증입니다. 실제 Qwen3-4B 추출은 SERVER_PENDING입니다."
+            if args.tiny
+            else "실제 weights 경로입니다."
+        ),
     }
     return _emit(payload)
 
@@ -682,19 +798,110 @@ def cmd_import_pairs(args: argparse.Namespace) -> int:
     )
 
 
-def cmd_collect_outcomes(args: argparse.Namespace) -> int:
-    """행동 측정 결과(outcome counts)를 적재합니다.
+def _load_plans(path: str) -> list:
+    """collection plan JSONL을 읽습니다."""
+    from .collect import CollectionPlan
 
-    실제 generation은 서버 GPU에서만 합니다. 로컬에서는 서버가 만든 JSONL을 읽어
-    store로 정리하는 것까지만 합니다.
+    rows = [
+        json.loads(line)
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return [CollectionPlan(**row) for row in rows]
+
+
+def _load_mock_responses(path: str) -> dict:
+    """로컬 검증용 mock generation 응답을 읽습니다."""
+    from .adapters.qwen import SlotResult
+
+    out = {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        out[row["slot_id"]] = SlotResult(**row)
+    return out
+
+
+def cmd_collect_outcomes(args: argparse.Namespace) -> int:
+    """행동 측정 결과를 적재하거나, 주입된 backend로 실제 실행 경로를 돕니다.
+
+    로컬에서는 mock backend로만 실행합니다. 실제 weights 로드와 generation은 서버 단계입니다.
     """
+    from .adapters import AdapterUnavailable
+    from .collect import collect_outcomes
+
     cfg = _load(args)
     out = Path(args.out) if args.out else cfg.run_dir / "outcomes.json"
+    store = OutcomeStore.load(out) if out.exists() else OutcomeStore()
+
+    if args.plans:
+        # ---- 실행 경로 (backend 주입) ----
+        plans = _load_plans(args.plans)
+        profile = cfg.server.thinking
+        if args.backend == "qwen":
+            if not args.execute_gpu:
+                raise CliError(
+                    "backend=qwen은 실제 GPU 실행이므로 --execute-gpu가 필요합니다"
+                )
+            _budget_gate(cfg)
+            from .adapters.qwen import QwenGenerationBackend
+
+            try:
+                backend = QwenGenerationBackend(profile)
+            except AdapterUnavailable as exc:
+                raise CliError(str(exc)) from exc
+        else:
+            if not args.mock_responses:
+                raise CliError("backend=mock은 --mock-responses JSONL이 필요합니다")
+            from .adapters.qwen import MockGenerationBackend
+
+            backend = MockGenerationBackend(_load_mock_responses(args.mock_responses))
+        budget = GpuBudget.open(
+            cfg.run_dir,
+            block_minutes=cfg.server.gpu_block_minutes,
+            stop_minutes=cfg.server.gpu_stop_minutes,
+        )
+        guard = BudgetGuard(budget) if args.backend == "qwen" else None
+        ledger = DedupLedger.open(cfg.run_dir, name="slot_ledger.jsonl")
+        try:
+            if guard is not None:
+                guard.start()
+            report = collect_outcomes(
+                backend,
+                plans,
+                profile,
+                ledger=ledger,
+                guard=guard,
+                policy_hash=profile.protocol_hash(),
+            )
+        except ValueError as exc:
+            raise CliError(str(exc)) from exc
+        finally:
+            if guard is not None:
+                guard.commit()
+        merge_report = store.merge(report.outcomes, mode=args.merge_mode)
+        store.save(out)
+        return _emit(
+            {
+                "status": "ok" if not report.stopped else "stopped",
+                "backend": args.backend,
+                "written": str(out),
+                "collection": report.as_dict(),
+                "merge": merge_report,
+                "store": store.report(),
+                "note": (
+                    "mock backend는 로컬 경로 검증 전용입니다. 실제 generation은 "
+                    "SERVER_PENDING입니다."
+                ),
+            }
+        )
+
     if not args.from_file:
         if not args.execute_gpu:
             raise CliError(
-                "collect-outcomes는 --from-file로 서버 결과를 적재하거나 "
-                "--execute-gpu로 실제 generation을 실행해야 합니다"
+                "collect-outcomes는 --from-file로 서버 결과를 적재하거나, --plans와 "
+                "backend로 실행 경로를 돌려야 합니다"
             )
         _budget_gate(cfg)
         pending = cfg.server.thinking.needs_calibration()
@@ -704,14 +911,12 @@ def cmd_collect_outcomes(args: argparse.Namespace) -> int:
                 "fix them in the server calibration manifest before a full GPU run "
                 "(SERVER_PENDING)"
             )
-        raise CliError(
-            "SERVER_PENDING: real Qwen3-4B behavior measurement runs on the server; "
-            "이 저장소는 로컬에서 실제 답변을 생성하지 않습니다"
-        )
-    store = OutcomeStore.load(out) if out.exists() else OutcomeStore()
-    incoming = OutcomeStore.from_jsonl(args.from_file)
+        raise CliError("--plans를 주어 실행 계획을 지정하세요 (SERVER_PENDING)")
+    incoming = OutcomeStore.from_jsonl(
+        args.from_file, fill_missing_as_not_started=args.fill_missing_as_not_started
+    )
     try:
-        merge_report = store.merge(incoming, mode=args.merge_mode)
+        merge_report = store.merge(incoming, mode=args.merge_mode, cohort=args.cohort)
     except ValueError as exc:
         raise CliError(str(exc)) from exc
     store.save(out)
@@ -722,8 +927,8 @@ def cmd_collect_outcomes(args: argparse.Namespace) -> int:
             "merge": merge_report,
             "store": store.report(),
             "note": (
-                "exact_continuation과 request_resume는 서로 다른 관측입니다. "
-                "X만 새 독립 generation으로 바꿔 기존 완료 기록과 합치지 않습니다."
+                "fill_not_started는 미시작 slot만 채우고, separate_cohort는 독립 재실행을 "
+                "별도로 보존합니다. 기존 X를 새 성공으로 대체하지 않습니다."
             ),
         }
     )
@@ -792,14 +997,19 @@ def cmd_predict_behavior(args: argparse.Namespace) -> int:
         out = model.forward_behavior(batch.inputs, stats)
         panel = model.panel_outputs(out, batch.pair_panel, batch.pair_slot, batch.panel_mask)
     trained = model.trained_heads() if hasattr(model, "trained_heads") else {}
+    robust_trained = bool(trained.get("robust", False))
+    drop_trained = bool(trained.get("pair_drop", False))
     panels = []
+    debug_panels = []
     for b, group in enumerate(groups):
         members = []
         for slot, variant_id in enumerate(batch.variant_ids[b]):
+            raw_drop = float(panel.pair_drop[b, slot])
             members.append(
                 {
                     "variant_id": variant_id,
-                    "pair_drop_hat": float(panel.pair_drop[b, slot]),
+                    # 학습되지 않은 head의 원시 score는 canonical 출력에 넣지 않습니다.
+                    "pair_drop_hat": raw_drop if drop_trained else None,
                     "pair_drop_label": (
                         float(batch.drop_target[b, slot])
                         if bool(batch.drop_mask[b, slot])
@@ -812,12 +1022,27 @@ def cmd_predict_behavior(args: argparse.Namespace) -> int:
             {
                 "original_id": group.original_id,
                 "panel_id": group.panel_id,
-                "robust_probability": float(panel.robust_prob[b]),
+                # robust head가 학습되지 않았으면 null/untrained로 표시합니다.
+                "robust_probability": float(panel.robust_prob[b]) if robust_trained else None,
+                "robust_head_status": "trained" if robust_trained else "untrained",
                 "robust_label": (
                     int(batch.robust_target[b]) if bool(batch.robust_mask[b]) else None
                 ),
-                "panel_max_drop_hat": float(panel.max_drop[b]),
+                # pair 예측에서 계산한 diagnostic이며 별도 학습 head가 아닙니다.
+                "panel_max_drop_diagnostic": (
+                    float(panel.max_drop[b]) if drop_trained else None
+                ),
                 "members": members,
+            }
+        )
+        debug_panels.append(
+            {
+                "original_id": group.original_id,
+                "raw_robust_probability": float(panel.robust_prob[b]),
+                "raw_pair_drop": [
+                    float(panel.pair_drop[b, slot])
+                    for slot in range(len(batch.variant_ids[b]))
+                ],
             }
         )
     payload_out = {
@@ -828,17 +1053,19 @@ def cmd_predict_behavior(args: argparse.Namespace) -> int:
         "trained_heads": trained,
         "untrained_heads": [name for name, ok in trained.items() if not ok],
         "panels": panels,
+        "max_drop_source": "derived_from_pair_predictions",
         "caveats": [
             "prediction residual은 robustness 지표가 아닙니다.",
             "학습되지 않은 head의 출력은 검증된 robust probability가 아닙니다.",
             "pair score와 pooling weight는 개별 변형의 causal importance가 아닙니다.",
         ],
     }
-    if trained and not trained.get("robust", False):
+    if not robust_trained or not drop_trained:
         payload_out["warning"] = (
-            "the robust head was never trained on a real label; robust_probability values "
-            "come from an untrained head"
+            "one or more heads were never trained on a real label; canonical outputs are null "
+            "and raw scores are only in debug_raw_scores"
         )
+        payload_out["debug_raw_scores"] = debug_panels
     if args.out:
         atomic_write_json(args.out, payload_out)
         payload_out["written"] = args.out
@@ -954,6 +1181,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_prep = sub.add_parser("prepare-data", help="DeepMath 후보/split 준비 (legacy: MathGAP)")
     common(p_prep)
     p_prep.add_argument("--input", default=None, help="local DeepMath JSONL/parquet snapshot")
+    p_prep.add_argument(
+        "--prepared", default=None, help="준비된 registry directory (frozen split 사용)"
+    )
     p_prep.add_argument("--out", default=None)
     p_prep.set_defaults(func=cmd_prepare_data)
 
@@ -975,6 +1205,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(OutcomeStore.MERGE_MODES),
         help="기존 기록과의 병합 방식",
     )
+    p_outcomes.add_argument("--cohort", default=None, help="separate_cohort에 쓸 cohort 이름")
+    p_outcomes.add_argument(
+        "--fill-missing-as-not-started",
+        action="store_true",
+        help="명시적 import 규칙: 미기록 planned slot을 not_started로 채웁니다",
+    )
+    p_outcomes.add_argument("--plans", default=None, help="collection plan JSONL")
+    p_outcomes.add_argument(
+        "--backend", default="mock", choices=["mock", "qwen"], help="generation backend"
+    )
+    p_outcomes.add_argument("--mock-responses", default=None, help="mock backend 응답 JSONL")
     p_outcomes.add_argument("--out", default=None)
     p_outcomes.set_defaults(func=cmd_collect_outcomes)
 
@@ -995,6 +1236,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_extract.add_argument("--hidden-size", type=int, default=32)
     p_extract.add_argument("--layers", type=int, default=4)
     p_extract.add_argument("--prompt-len", type=int, default=40)
+    p_extract.add_argument("--n-pages", type=int, default=1)
     p_extract.add_argument("--out", default=None)
     p_extract.set_defaults(func=cmd_extract)
 
@@ -1006,6 +1248,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_stage1.add_argument("--hidden-size", type=int, default=32)
     p_stage1.add_argument("--layers", type=int, default=4)
     p_stage1.add_argument("--prompt-len", type=int, default=40)
+    p_stage1.add_argument("--n-pages", type=int, default=1)
     p_stage1.add_argument("--out", default=None)
     p_stage1.set_defaults(func=cmd_run_stage1)
 

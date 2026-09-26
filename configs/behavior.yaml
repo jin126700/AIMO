@@ -2,7 +2,14 @@
 # Page shape는 자료가 결정합니다. label은 model input과 분리된 store에서 붙입니다.
 run:
   run_id: behavior_v2
-  seed: 0
+  seed: 0                # master seed. 아래 seeds의 빈 항목을 채웁니다.
+  seeds:
+    # data/split을 고정한 채 train/sampler만 바꿔 재현성을 확인할 수 있습니다.
+    data: null
+    split: null
+    train: null
+    sampler: null
+    eval: null
   device: cpu          # 실제 GPU 실행은 CLI의 --execute-gpu가 필요합니다.
   notes: "behavior-supervised joint training on screened DeepMath panels"
 

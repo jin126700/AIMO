@@ -280,8 +280,8 @@ def test_eval_mode_is_deterministic_and_dropout_off(datasets, stats):
     assert not torch.equal(a.detach(), b.detach())  # 학습 모드에서는 dropout이 적용됩니다
 
 
-def test_missing_behavior_supervision_is_reported_not_claimed(tmp_path):
-    """behavior supervision이 전혀 없으면 joint 성공으로 보고하지 않습니다."""
+def test_missing_behavior_supervision_fails_fast(tmp_path):
+    """활성화한 behavior objective에 supervision이 없으면 학습 시작 전에 멈춥니다."""
     payload = tiny_payload(
         model={"name": "joint"},
         train={"task": "joint", "max_epochs": 1, "patience": 1},
@@ -291,9 +291,95 @@ def test_missing_behavior_supervision_is_reported_not_claimed(tmp_path):
     payload["run"] = {"run_id": "nolabel", "seed": 0}
     cfg = config_from_dict(payload)
     datasets = make_synthetic_dataset(cfg)
-    summary = train(cfg, datasets)
-    assert summary["behavior_supervision_seen"] == {
-        "pair_drop": False, "robust": False, "max_drop": False
-    }
-    assert "warning" in summary
-    assert "not a joint training result" in summary["warning"]
+    with pytest.raises(ValueError, match="no valid behavior label"):
+        train(cfg, datasets)
+    # best checkpoint를 만들지 않습니다.
+    assert not (tmp_path / "nolabel" / "best.pt").exists()
+
+
+def test_flow_only_run_is_explicit_and_not_a_joint_result(tmp_path):
+    """label이 없어도 flow-only는 명시적으로 고르면 돌고, joint 결과로 보고하지 않습니다."""
+    payload = tiny_payload(
+        model={"name": "loop4"},
+        train={
+            "task": "flow", "select_metric": "total", "max_epochs": 1, "patience": 1,
+        },
+        data={"synthetic": {"behavior_labels": False}},
+    )
+    payload["paths"] = {"output_root": str(tmp_path)}
+    payload["run"] = {"run_id": "flowonly", "seed": 0}
+    cfg = config_from_dict(payload)
+    summary = train(cfg, make_synthetic_dataset(cfg))
+    assert summary["is_joint_result"] is False
+    assert "not a joint training result" in summary["note"]
+
+
+def test_select_metric_without_labels_fails_fast(tmp_path, datasets):
+    """선택한 validation 지표에 유효 label이 없으면 시작 전에 멈춥니다."""
+    cfg = joint_cfg(
+        tmp_path, run={"run_id": "nomax"}, model={"name": "joint"},
+        train={"task": "joint", "select_metric": "L_max_drop", "max_epochs": 1, "patience": 1},
+    )
+    with pytest.raises(ValueError, match="needs at least one of"):
+        train(cfg, datasets)
+
+
+def test_train_seed_does_not_change_data_or_labels(tmp_path, datasets):
+    """train_seed만 바꿔도 data/split/label hash는 같아야 합니다."""
+    hashes = []
+    for train_seed in (0, 7):
+        cfg = joint_cfg(
+            tmp_path,
+            run={"run_id": f"seed{train_seed}", "seed": 0,
+                 "seeds": {"train": train_seed, "sampler": train_seed}},
+            model={"name": "joint"},
+            train={"task": "joint", "max_epochs": 1, "patience": 1},
+        )
+        summary = train(cfg, make_synthetic_dataset(cfg))
+        hashes.append(
+            (
+                summary["hashes"]["split_hashes"],
+                summary["hashes"]["train_subset_hash"],
+                summary["hashes"]["stats_hash"],
+            )
+        )
+    assert hashes[0] == hashes[1]
+    # data seed를 바꾸면 달라져야 합니다.
+    other = joint_cfg(
+        tmp_path, run={"run_id": "dataseed", "seed": 0, "seeds": {"data": 11}},
+        model={"name": "joint"}, train={"task": "joint", "max_epochs": 1, "patience": 1},
+    )
+    summary = train(other, make_synthetic_dataset(other))
+    assert summary["hashes"]["split_hashes"] != hashes[0][0]
+
+
+def test_data_hash_detects_content_changes_not_just_ids(datasets):
+    """ID가 같고 내용만 달라도 hash가 달라야 합니다."""
+    import copy
+
+    original = datasets["train"]
+    changed = copy.deepcopy(original)
+    changed.groups[0].original.state[0, 0, 0] += 1e-3
+    object.__setattr__(changed.groups[0].original, "_fingerprint", None)
+    assert changed.split_structure_hash() == original.split_structure_hash()
+    assert changed.data_hash() != original.data_hash()
+    relabelled = copy.deepcopy(original)
+    variant_id = relabelled.groups[1].variants[1].variant_id
+    if variant_id in relabelled.groups[1].pair_labels:
+        relabelled.groups[1].pair_labels[variant_id].signed_drop = 0.99
+        assert relabelled.data_hash() != original.data_hash()
+
+
+def test_checkpoint_keeps_python_numpy_and_torch_rng(tmp_path, datasets):
+    cfg = joint_cfg(
+        tmp_path, run={"run_id": "rng"}, model={"name": "joint"},
+        train={"task": "joint", "max_epochs": 1, "patience": 1},
+    )
+    train(cfg, datasets)
+    payload = torch.load(tmp_path / "rng" / "last.pt", map_location="cpu")
+    rng = payload["rng"]
+    assert rng["torch_cpu"] is not None
+    assert rng["python"] is not None
+    assert rng["numpy"] is not None
+    # CUDA 재현성은 로컬에서 검증하지 않았습니다 (SERVER_PENDING).
+    assert rng["cuda_verified"] is False

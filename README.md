@@ -69,6 +69,8 @@ predictor의 loop `k`는 서로 다른 개념입니다. 자세한 내용은
 - run lock, atomic save, config/schema mismatch 차단, dedup/resume, GPU-active 175분 신규
   시작 차단과 180분 종료 (mock worker)
 - DeepMath / perturbation / Qwen thinking adapter를 작은 fixture로 CPU 검증
+- scorer exact 비교, thinking 경계 사례, microbatch loss/gradient 불변성, seed 분리,
+  collection/extraction runner(mock), 예산·중단 경로를 regression test로 검증
 
 known-test에서 `joint`(186k params)은 pair drop MAE 0.164로 behavior-only 0.237,
 `behavior_m0` 0.335, `constant` 0.274보다 낮고, pair support-swap을 하면 MAE가 늘어납니다
@@ -83,6 +85,15 @@ flow 지표만 보면 legacy flow-only(0.257)가 joint(0.423)보다 좋습니다
 있습니다.
 
 **legacy 검증 (E0, flow-only)**: v1 설정의 결과는 같은 문서의 E0 절에 보존했습니다.
+
+**검수 반영 (코드 수정 + CPU 재검증)**
+
+`0448258` 검수에서 나온 실제 문제를 고쳤습니다. 무엇을 고쳤고 어디까지 CPU로 확인했는지는
+[docs/FIXES.md](docs/FIXES.md)에 정리했습니다. 요약하면 scorer/parser 경계 사례, outcome
+counts와 bounds, panel coverage, resume 병합 규칙, microbatch loss 집계, metric 정의,
+seed 분리, device 경로, Page 추출 메모리, 예산·중단 경로, dataset 연결 코드입니다. 위 E0b
+수치는 이 수정 **이전**에 측정한 값이므로 그대로 두고, 수정 후에는 짧은 CPU smoke만
+다시 돌렸습니다.
 
 **서버 실험 전 (SERVER_PENDING)**
 

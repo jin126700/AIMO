@@ -89,13 +89,22 @@ planned_trials, completed_trials, termination_reason, policy_hash
   `not_started`는 모두 unresolved이며 **W로 합치지 않습니다**.
 - 같은 original의 실행 결과는 여러 variants에서 참조하지만 `prompt_id`가 같으면 같은
   관측이므로 중복 집계하지 않습니다.
+- `counts`는 음이 아닌 정수이고 **합이 정확히 `planned_trials`** 와 같아야 합니다. 기록되지
+  않은 planned slot은 불완전 입력으로 거부하고, 명시적 import 규칙
+  (`fill_missing_as_not_started`)으로만 `not_started`로 채웁니다.
+- `completed_trials`(generation 종료 수)와 `n_resolved`(점수 확정 수 = C + W)는 다릅니다.
+  `not_started`는 completed로 세지 않습니다.
 - merge mode를 구분합니다.
   - `new_only`: 새 prompt만 추가
-  - `exact_continuation`: 같은 trajectory를 이어받아 미확정만 채움 (`planned_trials`가
-    같아야 하고 이미 판정된 C/W가 줄 수 없음)
-  - `request_resume`: prompt 전체를 다시 요청한 **별개 관측**이므로 기존 counts와 합치지
-    않고 교체
+  - `exact_continuation`: 같은 trajectory를 이어받아 미확정만 채움. slot 단위 trajectory
+    증거(`request_id`, `seed`, `prompt_hash`, `policy_hash`, `token_prefix_hash`)가 양쪽에
+    있어야 하고, 증거가 없는 기존 aggregate record에는 이력을 만들어내지 않습니다
+  - `fill_not_started`: **미시작 slot만** 채우는 delta 기록. 완료된 slot(C/W/X/U_score/
+    infra_error)은 건드리지 않습니다
+  - `separate_cohort`: 독립 재실행. primary 기록을 바꾸지 않고 별도 cohort로 보존합니다
   `X`만 새 독립 generation으로 바꿔 기존 완료 기록과 합치지 않습니다.
+- `scorer_version`이 다른 기록을 같은 store에 섞지 않습니다. 이전 결과를 새 scorer 결과로
+  덮어쓰지 않습니다.
 
 ## 6. Behavior label
 
@@ -114,18 +123,31 @@ uncertainty를 함께 보존합니다.
 
 ```
 lower = C / N
-upper = (C + unknown) / N
+upper = (C + unresolved) / N          # 미확정은 정답일 수도 있으므로 upper에 포함
 pair drop bounds = (o_lower - v_upper, o_upper - v_lower)
 ```
+
+따라서 `planned=4, C=1, 나머지 3 미확정`이면 bounds는 `[0.25, 1.0]`입니다.
+`N = 0`이면 확률과 bounds가 모두 **undefined(None)** 입니다.
 
 이 구간을 95% CI라고 부르지 않습니다. **midpoint나 0으로 바꿔 supervised target을 만들지
 않습니다.** 미확정 pair는 behavior loss에서 제외하지만, Page와 semantic validity가 유효하면
 flow에는 쓸 수 있습니다. 제외율과 class/difficulty별 coverage를 보고합니다.
 
-### Panel max-drop
+### Panel coverage와 max-drop
+
+`expected_members`는 **frozen candidate manifest 전체**에서 만듭니다. 측정 기록이 없는
+variant도 기대 구성원으로 남으므로 partial panel이 complete로 표시되지 않습니다. coverage는
+세 단계로 구분해 기록합니다.
+
+```
+page_members    : Page가 존재하는 variant
+outcome_members : 행동 측정 기록이 존재하는 variant
+actual_members  : 점수가 확정되어 signed drop label이 생긴 variant
+```
 
 정의가 같은 signed pair drops, 같은 model/policy, 명시된 같은 panel이 모두 대응할 때만
-계산합니다. partial panel의 관측 최대값을 full-panel target으로 쓰지 않습니다. pair drop과
+max-drop을 계산합니다. partial panel의 관측 최대값을 full-panel target으로 쓰지 않습니다. pair drop과
 같은 counts에서 파생되면 이중 감독이 되므로 **기본적으로 pair regression만 켜고**
 max-drop은 diagnostic으로 보고합니다 (`train.use_max_drop: false`). 독립적인 panel-only
 target이 있을 때만 해당 loss를 켭니다.
@@ -186,7 +208,16 @@ numerical_backend, scorer_id, scorer_version
   truncate하지 않습니다. RoPE scaling을 바꾸면 protocol hash가 달라집니다.
 - reasoning을 허용하되 최종 답을 명확히 제출하게 합니다. **생각 중간에 정답 숫자가 나타났다는
   이유로 C 처리하지 않습니다** (thinking 블록 밖의 제출 영역만 채점합니다).
-- scorer는 version pin된 exact scorer입니다. 정답 확인에 LLM judge를 추가하지 않습니다.
+- scorer는 version pin된 exact scorer입니다 (현재 `2`). 지원 범위는 integer / 유한 decimal /
+  `a/b`·`\frac{a}{b}`이며 `fractions.Fraction`으로 정확히 비교합니다. 범위를 벗어난 표현은
+  **오답이 아니라 채점 불가**입니다. 임의 eval이나 untrusted expression 실행, LLM judge를
+  쓰지 않습니다.
+- 최종 답은 `\boxed{...}`(중첩 brace 지원) -> `final answer:` 라벨 순서로만 찾습니다.
+  임의의 마지막 숫자를 답으로 쓰지 않습니다. 같은 우선순위 후보가 여러 개면 전부 동치일 때만
+  채택하고, 하나라도 다르면 `U_score`입니다.
+- thinking 블록은 tag 상태를 순서대로 훑어 판정합니다. `</think>`가 `<think>`보다 먼저 나오면
+  prompt/template이 열어 둔 것으로 봅니다. generated text에 `<think>`가 있다고 가정하지
+  않으며, tag가 없다는 이유로 thinking 중간 내용을 최종 답으로 채점하지 않습니다.
 - cap-hit / 운영 중단 / 채점 모호를 W로 합치지 않습니다. 중간 checkpoint의 unresolved와
   명시된 최종 scoring deadline을 구분하며, 최종 cap에서의 실패 점수 정의는 protocol의
   `final_cap_failure_policy`로 따로 명시합니다.

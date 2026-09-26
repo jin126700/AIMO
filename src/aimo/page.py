@@ -59,6 +59,31 @@ class Page:
     variant_id: str
     is_identity: bool = False
     provenance: dict = field(default_factory=dict)
+    # content fingerprint 캐시. 직렬화 대상이 아닙니다.
+    _fingerprint: str | None = field(default=None, repr=False, compare=False)
+
+    def content_fingerprint(self) -> str:
+        """Page 내용의 실제 fingerprint.
+
+        ID 목록만 비교하면 같은 ID에 다른 값이 들어와도 알 수 없습니다. shape/dtype과
+        tensor bytes를 모두 해싱해 실제 데이터 변경을 구분합니다. 한 번 계산하면 캐시합니다.
+        """
+        if self._fingerprint is None:
+            digest = hashlib.sha256()
+            for tensor in (
+                self.state,
+                self.updates,
+                self.valid,
+                self.token_offsets,
+                self.relative_positions,
+            ):
+                array = tensor.detach().cpu().contiguous().numpy()
+                digest.update(str(array.shape).encode())
+                digest.update(str(array.dtype).encode())
+                digest.update(array.tobytes())
+            digest.update(self.variant_id.encode())
+            object.__setattr__(self, "_fingerprint", digest.hexdigest()[:16])
+        return self._fingerprint  # type: ignore[return-value]
 
     @property
     def n_blocks(self) -> int:

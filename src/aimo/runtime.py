@@ -72,6 +72,43 @@ class RunLockError(RuntimeError):
 
 
 @contextmanager
+def store_lock(path: str | Path, *, timeout: float = 10.0) -> Iterator[Path]:
+    """store 파일 하나에 대한 배타 lock.
+
+    O_CREAT|O_EXCL로 lock 파일을 만들고, 살아 있는 다른 pid가 쥐고 있으면 timeout까지
+    기다립니다. 다른 사용자의 process를 종료하지 않습니다.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            handle = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(handle, str(os.getpid()).encode())
+            os.close(handle)
+            break
+        except FileExistsError:
+            holder = -1
+            try:
+                holder = int(lock_path.read_text(encoding="utf-8").strip() or -1)
+            except (OSError, ValueError):
+                holder = -1
+            if holder > 0 and not _pid_alive(holder):
+                lock_path.unlink(missing_ok=True)  # 죽은 holder의 lock만 회수합니다.
+                continue
+            if time.monotonic() >= deadline:
+                raise RunLockError(
+                    f"store {path} is locked by pid {holder}; retry after it finishes"
+                ) from None
+            time.sleep(0.05)
+    try:
+        yield path
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+@contextmanager
 def run_lock(run_dir: str | Path, *, force: bool = False) -> Iterator[Path]:
     """한 run directory에 대해 하나의 실행만 허용합니다."""
     run_dir = Path(run_dir)
@@ -134,24 +171,33 @@ class DedupLedger:
 
     path: Path
     _seen: set[str] = field(default_factory=set)
+    _payloads: dict[str, dict] = field(default_factory=dict)
 
     @classmethod
     def open(cls, run_dir: str | Path, name: str = LEDGER_NAME) -> DedupLedger:
         path = Path(run_dir) / name
         path.parent.mkdir(parents=True, exist_ok=True)
         seen: set[str] = set()
+        payloads: dict[str, dict] = {}
         if path.exists():
             for line in path.read_text(encoding="utf-8").splitlines():
                 if not line.strip():
                     continue
                 try:
-                    seen.add(json.loads(line)["key"])
+                    record = json.loads(line)
+                    seen.add(record["key"])
+                    if record.get("payload") is not None:
+                        payloads[record["key"]] = record["payload"]
                 except (json.JSONDecodeError, KeyError):
                     continue  # 잘린 마지막 줄은 무시하고 다시 처리합니다.
-        return cls(path=path, _seen=seen)
+        return cls(path=path, _seen=seen, _payloads=payloads)
 
     def seen(self, key: str) -> bool:
         return key in self._seen
+
+    def payload(self, key: str) -> dict | None:
+        """저장된 payload. resume에서 이전 결과를 재사용할 때 씁니다."""
+        return self._payloads.get(key)
 
     def mark(self, key: str, payload: dict | None = None) -> None:
         if key in self._seen:
@@ -164,6 +210,8 @@ class DedupLedger:
             handle.flush()
             os.fsync(handle.fileno())
         self._seen.add(key)
+        if payload:
+            self._payloads[key] = payload
 
     def __len__(self) -> int:
         return len(self._seen)
@@ -244,36 +292,154 @@ class BudgetedRun:
     reason: str
 
 
+class StopRequest:
+    """협조적 중단 신호.
+
+    긴 작업 도중에도 `requested`를 polling해 스스로 멈출 수 있게 합니다. 다른 사용자의
+    process나 container를 종료하지 않습니다.
+    """
+
+    def __init__(self) -> None:
+        self._requested = False
+        self._reason = ""
+
+    def request(self, reason: str = "stop requested") -> None:
+        self._requested = True
+        self._reason = reason
+
+    @property
+    def requested(self) -> bool:
+        return self._requested
+
+    @property
+    def reason(self) -> str:
+        return self._reason
+
+    def __call__(self) -> bool:
+        return self._requested
+
+
+class BudgetGuard:
+    """긴 작업에 예산과 중단 신호를 연결합니다.
+
+    - `start()`에서 신규 시작을 막습니다 (누적 block_minutes 이상).
+    - context를 벗어날 때 **예외가 나도** elapsed를 저장합니다 (finally).
+    - `should_stop()`은 hard stop 도달 또는 외부 중단 요청을 알려 줍니다. step 사이 검사만으로
+      hard stop을 보장한다고 쓰지 않습니다: 작업 쪽에서 충분히 자주 polling해야 합니다.
+    - 소유한 subprocess는 `terminate_owned`로만 종료합니다.
+    """
+
+    def __init__(
+        self,
+        budget: GpuBudget,
+        stop: StopRequest | None = None,
+        seconds_per_step: Callable[[], float] | None = None,
+    ) -> None:
+        self.budget = budget
+        self.stop = stop or StopRequest()
+        self.seconds_per_step = seconds_per_step
+        self._started_at: float | None = None
+        self._owned: list = []
+
+    def start(self) -> str:
+        ok, reason = self.budget.can_start()
+        if not ok:
+            raise GpuBudgetExceeded(reason)
+        self._started_at = self.budget.clock()
+        return reason
+
+    def elapsed(self) -> float:
+        if self._started_at is None:
+            return 0.0
+        if self.seconds_per_step is not None:
+            return self.seconds_per_step()
+        return self.budget.clock() - self._started_at
+
+    def commit(self) -> float:
+        """지금까지의 elapsed를 예산에 적립하고 구간을 다시 엽니다."""
+        elapsed = self.elapsed()
+        if elapsed > 0:
+            self.budget.add(elapsed)
+        self._started_at = self.budget.clock()
+        return elapsed
+
+    def should_stop(self) -> tuple[bool, str]:
+        if self.stop.requested:
+            return True, self.stop.reason
+        # mock clock에서는 seconds_per_step이 '다음 step의 비용'이므로 경과로 빼지 않습니다.
+        pending = self.elapsed() if self.seconds_per_step is None else 0.0
+        if self.budget.remaining_stop_seconds() - pending <= 0:
+            return True, (
+                f"hard stop at {self.budget.stop_minutes:.0f} min GPU-active time "
+                f"(used {self.budget.active_seconds() / 60.0:.1f} min)"
+            )
+        return False, ""
+
+    def own(self, process) -> None:
+        """이 실행이 직접 시작한 subprocess만 등록합니다."""
+        self._owned.append(process)
+
+    def terminate_owned(self, grace: float = 5.0) -> list[int]:
+        """등록된(소유한) subprocess만 종료합니다. 다른 process는 건드리지 않습니다."""
+        stopped = []
+        for process in self._owned:
+            if process.poll() is not None:
+                continue
+            process.terminate()
+            try:
+                process.wait(timeout=grace)
+            except Exception:  # noqa: BLE001 - subprocess 구현에 따라 예외가 다릅니다
+                process.kill()
+            stopped.append(process.pid)
+        self._owned.clear()
+        return stopped
+
+    def __enter__(self) -> BudgetGuard:
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # 예외·중단 시에도 elapsed를 반드시 저장합니다.
+        try:
+            self.commit()
+        finally:
+            self.terminate_owned()
+            self._started_at = None
+
+
 def run_budgeted(
     step_fn: Callable[[int], None],
     budget: GpuBudget,
     max_steps: int,
     seconds_per_step: Callable[[], float] | None = None,
+    stop: StopRequest | None = None,
 ) -> BudgetedRun:
     """step_fn을 예산 안에서 반복 호출합니다.
 
-    step 사이에서만 중단을 판단하므로 외부 process를 강제 종료하지 않습니다.
+    step 사이에서 중단을 판단하며 외부 process를 강제 종료하지 않습니다. 예외가 나도
+    지금까지의 elapsed는 예산에 적립됩니다.
     seconds_per_step이 주어지면 그 값으로 GPU-active 시간을 적립합니다 (mock worker
     CPU 검증용). 없으면 실제 벽시계 시간을 씁니다.
     """
-    ok, reason = budget.can_start()
-    if not ok:
-        raise GpuBudgetExceeded(reason)
+    guard = BudgetGuard(budget, stop=stop, seconds_per_step=seconds_per_step)
+    reason = guard.start()
     done = 0
     stopped = False
-    for i in range(max_steps):
-        if budget.remaining_stop_seconds() <= 0:
-            stopped = True
-            reason = (
-                f"stopped at {budget.active_seconds() / 60.0:.1f} min GPU-active time "
-                f"(hard stop {budget.stop_minutes:.0f} min)"
-            )
-            break
-        started = budget.clock()
-        step_fn(i)
-        elapsed = seconds_per_step() if seconds_per_step else budget.clock() - started
-        budget.add(elapsed)
-        done += 1
+    try:
+        for i in range(max_steps):
+            hit, why = guard.should_stop()
+            if hit:
+                stopped = True
+                reason = why
+                break
+            started = budget.clock()
+            step_fn(i)
+            elapsed = seconds_per_step() if seconds_per_step else budget.clock() - started
+            budget.add(elapsed)
+            guard._started_at = budget.clock()  # 적립한 구간은 다시 세지 않습니다
+            done += 1
+    finally:
+        guard.terminate_owned()
     if not stopped:
         reason = f"completed {done} step(s) within budget"
     return BudgetedRun(
@@ -299,3 +465,34 @@ def mock_gpu_worker(seconds_per_step: float) -> tuple[Callable[[int], None], Cal
 
     step.log = log  # type: ignore[attr-defined]
     return step, cost
+
+
+# --------------------------------------------------------------------------------------
+# Device 해석
+# --------------------------------------------------------------------------------------
+
+
+def resolve_device(name: str) -> torch.device:
+    """config의 device 문자열을 torch.device로 바꿉니다.
+
+    요청한 accelerator가 없으면 **명시적으로 오류**를 냅니다. CPU로 조용히 fallback하지
+    않습니다.
+    """
+    text = (name or "cpu").strip().lower()
+    if text.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"device {name!r} was requested but CUDA is not available in this process; "
+                "refusing to fall back to CPU silently"
+            )
+        return torch.device(text)
+    if text == "mps":
+        if not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available():
+            raise RuntimeError(
+                f"device {name!r} was requested but MPS is not available in this process; "
+                "refusing to fall back to CPU silently"
+            )
+        return torch.device("mps")
+    if text == "cpu":
+        return torch.device("cpu")
+    raise ValueError(f"unsupported device {name!r}; use 'cpu', 'cuda[:N]' or 'mps'")
