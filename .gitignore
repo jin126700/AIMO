@@ -44,3 +44,7 @@ wandb/
 
 # OS noise
 .DS_Store
+
+# Local experiment coordination
+.Loop_result.lock
+.deepmath_current_run

@@ -8,12 +8,12 @@ run:
   notes: "E1/E2 server run"
 
 paths:
-  input_root: /data1/HKM/data
-  output_root: /data1/HKM/result/AIMO/HKM/aimo_v2
+  input_root: /data1/Data/AIMO/Datasets
+  output_root: /data1/HKM/result/AIMO
 
 data:
   source: pages
-  page_dir: /data1/HKM/result/AIMO/HKM/aimo_v2/pages
+  page_dir: /data1/HKM/result/AIMO/pages
   subset_fraction: 1.0
   scale_floor: 1.0e-6
 
@@ -33,8 +33,8 @@ train:
 
 server:
   repo_root: /data1/HKM/AIMO
-  input_root: /data1/HKM/data
-  output_root: /data1/HKM/result/AIMO/HKM/aimo_v2
+  input_root: /data1/Data/AIMO/Datasets
+  output_root: /data1/HKM/result/AIMO
   model_id: Qwen/Qwen3-4B
   tiny_config: false
   gpu_block_minutes: 175    # 누적 GPU-active 175분 이상이면 새 작업 시작을 막습니다.

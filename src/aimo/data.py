@@ -807,7 +807,7 @@ def page_policy_identity(page: Page) -> dict[str, str]:
     return {key: str(provenance.get(key, "")) for key in PAGE_POLICY_KEYS}
 
 
-def check_page_label_policy(page: Page, label_policy_hash: str) -> None:
+def check_page_label_policy(page: Page, label_policy_hash: str, *, observation_behavior_mapping: dict | None = None) -> None:
     """Page의 실제 model/tokenizer/template/prompt policy가 label과 대응하는지 검사합니다.
 
     **빈 hash를 동일성의 근거로 쓰지 않습니다.** 한쪽이라도 비어 있으면 대응을 확인할 수
@@ -836,6 +836,26 @@ def check_page_label_policy(page: Page, label_policy_hash: str) -> None:
             f"label for {page.variant_id!r} has an empty policy_hash; refusing to treat it as "
             "matching the page provenance"
         )
+    if identity["policy_hash"] != label_policy_hash and observation_behavior_mapping is not None:
+        mapping = observation_behavior_mapping
+        entry = mapping.get("pages", {}).get(page.variant_id, {})
+        checks = [
+            mapping.get("behavior_policy_id") == label_policy_hash,
+            mapping.get("observation_policy_id") == identity["policy_hash"],
+            mapping.get("target_model_revision") == identity["model_hash"],
+            mapping.get("target_model_config_hash") == identity["config_hash"],
+            mapping.get("tokenizer_hash") == identity["tokenizer_hash"],
+            bool(mapping.get("template_hash")) and mapping.get("template_hash") == provenance.get("template_hash"),
+            entry.get("original_id") == page.original_id,
+            entry.get("content_fingerprint") == page.content_fingerprint(),
+            bool(entry.get("input_token_hash")),
+            entry.get("input_token_hash") == provenance.get("input_token_hash"),
+            mapping.get("observation_dtype") == "float32",
+            mapping.get("behavior_dtype") == "bfloat16",
+        ]
+        if not all(checks):
+            raise ValueError("Explicit observation/behavior mapping mismatch: " + page.variant_id)
+        return
     if identity["policy_hash"] != label_policy_hash:
         raise ValueError(
             f"page {page.variant_id!r} was produced under policy "
@@ -845,7 +865,8 @@ def check_page_label_policy(page: Page, label_policy_hash: str) -> None:
 
 
 def attach_labels(
-    datasets: dict[str, PageDataset], store: LabelStore, *, check_provenance: bool = True
+    datasets: dict[str, PageDataset], store: LabelStore, *, check_provenance: bool = True,
+    observation_behavior_mapping: dict | None = None
 ) -> dict:
     """LabelStore의 label을 group에 붙입니다.
 
@@ -868,8 +889,8 @@ def attach_labels(
                         f"{label.original_id!r}, not {group.original_id!r}"
                     )
                 if check_provenance:
-                    check_page_label_policy(variant, label.policy_hash)
-                    check_page_label_policy(group.original, label.policy_hash)
+                    check_page_label_policy(variant, label.policy_hash, observation_behavior_mapping=observation_behavior_mapping)
+                    check_page_label_policy(group.original, label.policy_hash, observation_behavior_mapping=observation_behavior_mapping)
                     checked_pages += 2
                 group.pair_labels[variant.variant_id] = label
                 group.panel_id = group.panel_id or label.panel_id
@@ -877,7 +898,7 @@ def attach_labels(
             panel = store.panels.get(group.original_id)
             if panel is not None:
                 if check_provenance and panel.policy_hash:
-                    check_page_label_policy(group.original, panel.policy_hash)
+                    check_page_label_policy(group.original, panel.policy_hash, observation_behavior_mapping=observation_behavior_mapping)
                     checked_pages += 1
                 group.panel_label = panel
                 group.panel_id = group.panel_id or panel.panel_id

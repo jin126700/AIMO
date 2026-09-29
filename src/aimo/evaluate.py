@@ -138,8 +138,10 @@ def evaluate_dataset(
         acc["support_swap_degradation"] = MetricAccumulator()
 
     for bucket in group_by_cut(samples):
-        batch = collate(bucket)
-        _accumulate_batch(model, batch, stats, acc, horizons, support_swap)
+        # Bound real 4B Page memory without changing samples or original weighting.
+        for offset in range(0, len(bucket), 1):
+            batch = collate(bucket[offset : offset + 1]).to(next(model.parameters(), stats.input_state_scale).device)
+            _accumulate_batch(model, batch, stats, acc, horizons, support_swap)
 
     results = {
         "split": dataset.split,
@@ -373,7 +375,7 @@ def evaluate_behavior(
         dataset.groups[i : i + microbatch] for i in range(0, len(dataset.groups), microbatch)
     ]
     for chunk in chunks:
-        batch = collate_panels(chunk)
+        batch = collate_panels(chunk).to(next(model.parameters()).device)
         out = model.forward_behavior(batch.inputs, stats)
         panel = model.panel_outputs(out, batch.pair_panel, batch.pair_slot, batch.panel_mask)
         pred = panel.pair_drop  # [B, M], padding은 NaN
@@ -433,7 +435,7 @@ def evaluate_behavior(
             )
             for group in chunk
         ]
-        flipped_batch = collate_panels(flipped)
+        flipped_batch = collate_panels(flipped).to(next(model.parameters()).device)
         flipped_out = model.forward_behavior(flipped_batch.inputs, stats)
         flipped_panel = model.panel_outputs(
             flipped_out,
@@ -496,6 +498,7 @@ def evaluate_behavior(
         "n_supervised_pairs": n_supervised_pairs,
         "supervised_pair_coverage": (n_supervised_pairs / n_pairs) if n_pairs else 0.0,
         "trained_heads": trained,
+        "per_original_metrics": {name: {k: sum(v)/len(v) for k,v in a.per_group.items()} for name,a in acc.items()},
         "metrics": {
             name: a.summary(bootstrap_samples=bootstrap_samples, seed=seed)
             for name, a in acc.items()

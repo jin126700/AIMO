@@ -1,3 +1,34 @@
+## Current primary: Flow representation learning → frozen robustness probe
+
+현재 primary는 **E-FLOW-1**이다. 직전 FP32 behavior regression의 전체 81 valid pairs 중
+77개가 zero-drop이었고, known-test 10 originals / 19 pairs에서 zero baseline이 Joint보다
+우수했다. 이것은 architecture 자체의 실패를 입증하지 않는다.
+
+- Stage 1: 행동 label 파일을 읽지 않는 Page-only loader. 기존 train의 ID hash로
+  flow_train 28 / flow_dev 4를 freeze한다. Flow normalization은 flow_train만 사용한다.
+- Shared LoopedCore ×4, d_model128 / heads4 / FFN256 / dropout0.1을 유지한다.
+  objective는 L_next + L_within + 0.25 L_roll이며 flow_dev L_flow로 checkpoint를 선택한다.
+- Stage 2: encoder 완전 동결, full-page observed valid hidden mask-mean z128,
+  panel mean/std256 (population std; singleton std0). 새로운 pair query/head는 없다.
+- Zero/train-mean Flow baseline, original-only M0, RawChange, random-init core,
+  train original-label shuffle20회와 작은 L2 logistic probe를 비교한다.
+- 실데이터에서 검증된 criterion이 없으면 threshold를 만들지 않는다.
+  class 또는 criterion 부족은 ROBUSTNESS_PROBE_DATA_LIMIT이며 BCE/AUROC/bootstrap을
+  강제로 실행하지 않는다. feature extraction과 Flow validation/diagnostics는 진행한다.
+- Flow decodability ≠ robustness; robustness prediction/probe separability ≠ causal mechanism.
+  representation stability ≠ robustness. activation patching 이전에는 causal evidence를 주장하지 않는다.
+- 아래 Behavior-primary / joint / legacy 지침은 **historical v2 baseline**에 적용한다.
+  기존 Behavior head와 loss는 삭제하지 않는다. 이 E-FLOW-1 정의가 현재 primary에 우선한다.
+
+실행:
+```sh
+python -m aimo flow-representation-experiment --source /path/to/frozen_fp32_run --run-dir /path/to/new_run
+CUDA_VISIBLE_DEVICES=0 python -m aimo flow-representation-experiment --run-dir /path/to/new_run --execute-gpu
+```
+첫 명령은 Page audit와 split/spec freeze이며 GPU inference를 하지 않는다.
+둘째 명령은 기존 predictor만 학습한다. 기존 source 결과는 읽기 전용이다.
+source/control hashes와 독립 run의 config를 보존하고 automatic push를 하지 않는다.
+
 # AIMO
 
 original–variant pair의 **행동 변화**(correctness drop / robustness)를 감독 신호로 삼아

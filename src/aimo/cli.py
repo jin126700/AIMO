@@ -705,22 +705,41 @@ def cmd_extract(args: argparse.Namespace) -> int:
             raise CliError(str(exc)) from exc
         family, real_weights = cfg.server.model_id, True
 
-    torch.manual_seed(cfg.run.resolved_seeds()["data"])
-    prompt_len = args.prompt_len
     requests = []
-    for index in range(max(args.n_pages, 1)):
-        input_ids = torch.randint(0, 64, (1, prompt_len))
-        offsets, valid, rel = select_landmarks(list(range(1, prompt_len, 2)), prompt_len)
-        requests.append(
-            ExtractionRequest(
-                original_id="tiny-orig",
-                variant_id=f"tiny-orig#var{prompt_len:03d}_{index:02d}",
-                input_ids=input_ids,
-                landmark_offsets=offsets,
-                valid=valid,
-                relative_positions=rel,
+    if args.tiny:
+        torch.manual_seed(cfg.run.resolved_seeds()["data"])
+        prompt_len = args.prompt_len
+        for index in range(max(args.n_pages, 1)):
+            input_ids = torch.randint(0, 64, (1, prompt_len))
+            offsets, valid, rel = select_landmarks(list(range(1, prompt_len, 2)), prompt_len)
+            requests.append(
+                ExtractionRequest(
+                    original_id="tiny-orig",
+                    variant_id=f"tiny-orig#var{prompt_len:03d}_{index:02d}",
+                    input_ids=input_ids,
+                    landmark_offsets=offsets,
+                    valid=valid,
+                    relative_positions=rel,
+                )
             )
-        )
+    else:
+        if not args.requests:
+            raise CliError("Real extraction requires --requests with frozen rendered input IDs")
+        for item in json.loads(Path(args.requests).read_text()):
+            text = _tokenizer.apply_chat_template(
+                [{"role": "user", "content": item["prompt"]}], tokenize=False,
+                add_generation_prompt=True, enable_thinking=cfg.server.thinking.enable_thinking)
+            encoded = _tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+            if encoded["input_ids"] != item["rendered_input_ids"]:
+                raise CliError("Page/generation rendered token mismatch")
+            start = text.index(item["prompt"])
+            end = start + len(item["prompt"])
+            body = [i for i,(a,b) in enumerate(encoded["offset_mapping"]) if a>=start and b<=end and b>a]
+            positions = [body[round(j*(len(body)-1)/15)] for j in range(16)]
+            offsets, valid, rel = select_landmarks(positions, len(encoded["input_ids"]))
+            requests.append(ExtractionRequest(
+                item.get("original_id", item["prompt_id"]), item["prompt_id"],
+                torch.tensor([encoded["input_ids"]], device=cfg.run.device), offsets, valid, rel))
     ledger = DedupLedger.open(cfg.run_dir, name="extract_ledger.jsonl")
     try:
         if guard is not None:
@@ -848,7 +867,9 @@ def cmd_collect_outcomes(args: argparse.Namespace) -> int:
             from .adapters.qwen import QwenGenerationBackend
 
             try:
-                backend = QwenGenerationBackend(profile)
+                from .adapters.qwen import load_real_qwen
+                model, tokenizer = load_real_qwen(cfg)
+                backend = QwenGenerationBackend(profile, model, tokenizer)
             except AdapterUnavailable as exc:
                 raise CliError(str(exc)) from exc
         else:
@@ -1232,6 +1253,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_extract = sub.add_parser("extract", help="Page 추출")
     common(p_extract)
+    p_extract.add_argument("--requests", default=None, help="Frozen real prompt/token request manifest")
     p_extract.add_argument("--tiny", action="store_true", help="random-init tiny config CPU 검증")
     p_extract.add_argument("--hidden-size", type=int, default=32)
     p_extract.add_argument("--layers", type=int, default=4)
@@ -1252,6 +1274,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_stage1.add_argument("--out", default=None)
     p_stage1.set_defaults(func=cmd_run_stage1)
 
+    p_real = sub.add_parser("deepmath-real", help="Frozen real-data experiment")
+    p_real.add_argument("--run-dir", required=True)
+    p_real.add_argument("--stage", choices=["prepare", "calibration", "finish", "audit-resume"], required=True)
+    p_real.add_argument("--execute-gpu", action="store_true")
+    from .real_run import command
+    p_real.set_defaults(func=command)
+    p_flow = sub.add_parser("flow-representation-experiment", help="E-FLOW-1 label-free Flow + frozen probe")
+    p_flow.add_argument("--run-dir", required=True)
+    p_flow.add_argument("--source", default=None)
+    p_flow.add_argument("--execute-gpu", action="store_true")
+    from .flow_representation import command as flow_command
+    p_flow.set_defaults(func=flow_command)
     return parser
 
 

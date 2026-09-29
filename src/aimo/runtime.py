@@ -33,7 +33,10 @@ def atomic_write_text(path: str | Path, text: str) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(text, encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, path)
     return path
 
@@ -249,6 +252,12 @@ class GpuBudget:
         clock: Callable[[], float] = time.monotonic,
         name: str = BUDGET_NAME,
     ) -> GpuBudget:
+        existing = Path(run_dir) / name
+        if existing.exists() and "owned_pids" in json.loads(existing.read_text()):
+            raise GpuBudgetExceeded(
+                "This experiment budget is owned by the shared supervisor; use deepmath-real "
+                "instead of opening an independent stage budget"
+            )
         return cls(
             path=Path(run_dir) / name,
             block_minutes=block_minutes,

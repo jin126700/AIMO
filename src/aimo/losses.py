@@ -213,8 +213,8 @@ def rollout_loss(
     per_horizon: dict[int, TermValue] = {}
     zero = batch.target_a.sum() * 0.0
     n_items = batch.valid.shape[0]
-    accumulated = torch.zeros(n_items, dtype=batch.valid_dtype)
-    contributions = torch.zeros(n_items, dtype=batch.valid_dtype)
+    accumulated = torch.zeros(n_items, dtype=batch.valid_dtype, device=batch.valid.device)
+    contributions = torch.zeros(n_items, dtype=batch.valid_dtype, device=batch.valid.device)
 
     for horizon in horizons:
         if horizon not in usable:
@@ -222,9 +222,9 @@ def rollout_loss(
             continue
         depth = batch.cut + horizon
         mask = batch.valid.view(n_items, -1, 1)
-        per_item_sum = torch.zeros(n_items, dtype=batch.valid_dtype)
-        per_item_n = torch.zeros(n_items, dtype=batch.valid_dtype)
-        horizon_keep = torch.zeros(n_items, dtype=torch.bool)
+        per_item_sum = torch.zeros(n_items, dtype=batch.valid_dtype, device=batch.valid.device)
+        per_item_n = torch.zeros(n_items, dtype=batch.valid_dtype, device=batch.valid.device)
+        horizon_keep = torch.zeros(n_items, dtype=torch.bool, device=batch.valid.device)
         for result, truth, side_mask in (
             (result_a, batch.future_state_diff_a, None),
             (result_b, batch.future_state_diff_b, batch.has_sibling),
@@ -282,6 +282,7 @@ def flow_term_counts(
     batch: PairBatch, stats: NormStats, horizons: tuple[int, ...] = (2, 4)
 ) -> dict[str, int]:
     """model forward 없이 flow 항별 유효 원문 수를 셉니다 (global denominator용)."""
+    stats = stats.to(batch.valid.device)
     return {
         "next": next_update_count(batch, stats),
         "within": within_original_count(batch, stats),

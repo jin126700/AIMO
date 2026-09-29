@@ -444,6 +444,31 @@ class LoopedPredictor(nn.Module):
         cell_valid = inp.valid[:, layout.landmark].unsqueeze(-1)  # [B, S, 1]
         return features * cell_valid
 
+    @torch.no_grad()
+    def encode_pair(self, original, variant, stats: NormStats, *, original_only=False) -> Tensor:
+        """Flow core의 full-page valid observation mean. 새 query/head 없이 128-d."""
+        if self.training:
+            raise ValueError("representation extraction requires eval mode")
+        device = next(self.parameters()).device
+        valid = original.valid if original_only else original.valid & variant.valid
+        if not bool(valid.any()):
+            raise ValueError("no common valid landmarks; do not insert zero embedding")
+        inp = FlowInput(
+            cut=self.n_blocks, orig_state=original.state[None],
+            orig_updates=original.updates[None], var_state_prefix=variant.state[None],
+            var_updates_prefix=variant.updates[None], valid=valid[None],
+            relative_positions=original.relative_positions[None],
+            token_offsets=original.token_offsets[None],
+        ).to(device)
+        layout = build_layout(self.n_blocks, self.n_landmarks, self.n_blocks,
+                              self.use_variant_prefix, device)
+        features = self._cell_features(inp, stats, layout)
+        x0 = self.core.embed(features, layout, inp.relative_positions[:, layout.landmark])
+        hidden = self.core.run_loops(x0, build_attention_mask(layout, inp.valid[:, layout.landmark]))
+        kind = KIND_REF if original_only else KIND_OBS
+        keep = (layout.kind == kind)[None] & inp.valid[:, layout.landmark]
+        return (hidden * keep[..., None]).sum(1) / keep.sum(1, keepdim=True)
+
     def forward(self, inp: FlowInput, stats: NormStats) -> Tensor:
         """normalized V_hat[cut], shape [B, P, 2, H]."""
         if inp.n_blocks != self.n_blocks:

@@ -128,7 +128,7 @@ store lock).
 | parquet 전체를 `to_pylist`로 펼침 | `ParquetFile.iter_batches(batch_size, columns=...)`로 **필요한 column만 batch 단위**로 읽습니다. r1 풀이 본문은 즉시 버리고 개수만 남깁니다 |
 | 준비된 registry를 직접 읽는 경로 없음 | `load_prepared_registry`가 `inputs/answers/metadata/pairs/splits`를 읽고, `splits.json`이 있으면 **그 frozen split을 그대로** 씁니다 (`assign_splits(frozen=...)`로 덮어쓰지 않습니다) |
 | 외부 semantic status 변환 규칙 없음 | `verified_by_construction`(생성 규칙이 근거) / `verified_by_existing_evidence`(evidence 필수) / `pending` / `rejected`를 내부 schema로 옮기며 근거를 보존합니다. **pending·rejected는 verified로 승격하지 않습니다** |
-| dataset/result 경로 | `configs/deepmath.example.yaml`에 dataset `/data1/Data/AIMO/Datasets`, result `/data1/HKM/result/AIMO/HKM/aimo_v2/<run_id>/`를 반영했습니다. 로컬에서 경로 존재를 확인하거나 만들지 않았습니다 |
+| dataset/result 경로 | `configs/deepmath.example.yaml`에 dataset `/data1/Data/AIMO/Datasets`, result `/data1/HKM/result/AIMO/<run_id>/`를 반영했습니다. 로컬에서 경로 존재를 확인하거나 만들지 않았습니다 |
 
 CPU 검증: 작은 JSONL/parquet fixture만 사용했습니다. 새 후보 선정·split 생성·screening 계획
 실행은 하지 않았습니다.
@@ -169,3 +169,12 @@ git diff --check       clean
   regression이 실제 supervision)
 - 독립적인 panel-only max-drop target
 - 실제 자료에서의 예산 소진 동작 (로컬은 fake clock과 mock worker로만 검증)
+
+## DeepMath BF16 follow-up (2026-09-26 UTC)
+
+- `bf16_batch.py`: native Qwen3 DynamicCache batch decoding, independent request CUDA RNG, prompt-only input, EOS/cap/external-stop separation, immediate per-slot evidence callback.
+- `bf16_collect.py`: frozen group scheduling and durable slot identities; started/crashed requests are unresolved and never independently retried in the same cohort.
+- `bf16_budget.py`: successor budget inherits the frozen FP32 run's actual cumulative time; overlapping GPU wall time is counted once. Existing FP32 STOP/results remain unchanged.
+- `data.py`: cross-dtype Page/label attachment requires an explicit mapping that verifies policy, checkpoint, tokenizer, template, input hash and Page fingerprint. Default cross-policy rejection remains.
+- `bf16_post.py`: FP32 Page reuse/extraction, minimum-label gate, existing seed0 comparison models, validation-only checkpoint selection, original-group paired held-out evaluation.
+- Runtime HOME/cache is isolated under the follow-up result directory. Short-cap performance tests never become behavior labels. Follow-up artifacts and exact commands: `/data1/HKM/result/AIMO/deepmath_bf16_20260926T202430Z/`.

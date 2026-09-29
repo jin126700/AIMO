@@ -566,6 +566,8 @@ class SlotResult:
     generated_token_ids: list[int] | None = None
     thinking_already_open: bool = False
     error_message: str | None = None
+    input_token_ids: list[int] | None = None
+    termination_reason: str = "unknown"
 
 
 class MockGenerationBackend:
@@ -609,11 +611,56 @@ class QwenGenerationBackend:
         self.profile = profile
         self.model = model
         self.tokenizer = tokenizer
+        self.stop_check = lambda: False
+        self.special_token_ids = frozenset(tokenizer.all_special_ids)
+        self.model_hash = profile.model_revision or "unknown"
 
-    def generate(self, request: SlotRequest) -> SlotResult:  # pragma: no cover - 서버 전용
-        raise AdapterUnavailable(
-            f"{SERVER_PENDING}: real generation runs on the server; verified locally only "
-            "through MockGenerationBackend"
+    def render(self, prompt: str) -> dict:
+        text = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False,
+            add_generation_prompt=True, enable_thinking=self.profile.enable_thinking,
+        )
+        encoded = self.tokenizer(text, add_special_tokens=False, return_tensors="pt")
+        return {"text": text, **encoded}
+
+    def generate(self, request: SlotRequest) -> SlotResult:
+        tf = _transformers()
+        rendered = self.render(request.prompt)
+        ids = rendered["input_ids"]
+        n = ids.shape[1]
+        check_total_context(n, self.profile.max_new_tokens, self.profile.max_total_context)
+        device = next(self.model.parameters()).device
+        stopped = [False]
+        backend = self
+        class Stop(tf.StoppingCriteria):
+            def __call__(self, input_ids, scores, **kwargs):
+                stopped[0] = bool(backend.stop_check())
+                return stopped[0]
+        # Serial request-local RNG: restore both CPU and CUDA state after every request.
+        devices = [device.index or 0] if device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices), torch.inference_mode():
+            torch.manual_seed(request.seed)
+            if device.type == "cuda":
+                torch.cuda.manual_seed(request.seed)
+            output = self.model.generate(
+                input_ids=ids.to(device), attention_mask=rendered["attention_mask"].to(device),
+                do_sample=self.profile.do_sample, temperature=self.profile.temperature,
+                top_p=self.profile.top_p, top_k=self.profile.top_k, min_p=self.profile.min_p,
+                max_new_tokens=self.profile.max_new_tokens,
+                stopping_criteria=tf.StoppingCriteriaList([Stop()]), use_cache=True,
+                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+            )
+        generated = output[0, n:].cpu().tolist()
+        eos = self.model.generation_config.eos_token_id
+        eos = eos if isinstance(eos, list) else [eos]
+        ended = bool(generated and generated[-1] in eos)
+        reason = "eos" if ended else "external_stop" if stopped[0] else "token_cap"
+        return SlotResult(
+            slot_id=request.slot_id, text=self.tokenizer.decode(generated, skip_special_tokens=False),
+            prompt_tokens=n, generated_tokens=len(generated), generated_token_ids=generated,
+            input_token_ids=ids[0].tolist(), hit_cap=reason == "token_cap",
+            thinking_already_open=rendered["text"].rstrip().endswith("<think>"),
+            termination_reason=reason,
         )
 
 
@@ -643,6 +690,7 @@ def run_page_extraction(
     guard=None,
     provenance: dict | None = None,
     tolerance: float = 1e-3,
+    output_dir=None,
 ) -> tuple[list[Page], dict]:
     """요청 목록을 실제로 추출합니다. tiny model과 실제 weights가 같은 경로를 씁니다.
 
@@ -650,10 +698,26 @@ def run_page_extraction(
     부분 결과를 돌려줍니다. hook 안에서 landmark만 CPU로 복사하므로 layer 수에 비례해
     전체 activation을 들고 있지 않습니다.
     """
+    import hashlib, json, os
+    from pathlib import Path
+    from ..page import save_pages, load_pages
+    from ..runtime import atomic_write_json
+    if ledger is not None and output_dir is None:
+        output_dir = ledger.path.parent / "page_artifacts"
     pages: list[Page] = []
     report = {"extracted": 0, "skipped": 0, "stopped": False, "stop_reason": "", "errors": []}
     for request in requests:
-        if ledger is not None and ledger.seen(request.variant_id):
+        key = hashlib.sha256(json.dumps({
+            "variant": request.variant_id, "tokens": request.input_ids.cpu().tolist(),
+            "provenance": provenance, "offsets": request.landmark_offsets.tolist(),
+        }, sort_keys=True).encode()).hexdigest()
+        path = Path(output_dir) / (key + ".npz") if output_dir else None
+        if path is not None and path.exists():
+            checksum_path = path.with_suffix(".sha256")
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            if not checksum_path.exists() or checksum_path.read_text() != actual:
+                raise ValueError("Page checksum mismatch: " + str(path))
+            pages.extend(load_pages(path))
             report["skipped"] += 1
             continue
         if guard is not None:
@@ -683,10 +747,20 @@ def run_page_extraction(
                 f"{request.variant_id}: residual identity error {error:.3e} > {tolerance:.3e}"
             )
             continue
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.stem + ".tmp.npz")
+            save_pages([page], tmp)
+            os.replace(tmp, path)
+            checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+            from ..runtime import atomic_write_text
+            atomic_write_text(path.with_suffix(".sha256"), checksum)
+            load_pages(path)
         pages.append(page)
         report["extracted"] += 1
         if ledger is not None:
-            ledger.mark(request.variant_id, {"residual_identity_error": error})
+            ledger.mark(key, {"residual_identity_error": error, "path": str(path),
+                              "sha256": checksum})
     return pages, report
 
 
@@ -708,7 +782,21 @@ def load_real_qwen(cfg) -> tuple[nn.Module, object]:
             f"{SERVER_PENDING}: transformers {tf.__version__} has no Qwen3 support; "
             "Qwen3-4B needs transformers>=4.51 on the server"
         )
-    raise AdapterUnavailable(
-        f"{SERVER_PENDING}: loading {profile.model_id!r} weights is a server step; this "
-        "repository does not download them locally"
-    )
+    if profile.model_id != "Qwen/Qwen3-4B" or not profile.model_revision or not profile.model_path:
+        raise AdapterUnavailable("SERVER_PENDING: exact Qwen3-4B snapshot revision and local path required")
+    from pathlib import Path
+    path = Path(profile.model_path)
+    if path.name != profile.model_revision:
+        raise AdapterUnavailable("Snapshot path must end with the pinned revision")
+    dtype = {"fp32_sdpa": torch.float32, "bf16_sdpa": torch.bfloat16}.get(profile.numerical_backend)
+    if dtype is None:
+        raise AdapterUnavailable("Unsupported calibrated numerical backend")
+    tokenizer = tf.AutoTokenizer.from_pretrained(path, local_files_only=True)
+    model = tf.AutoModelForCausalLM.from_pretrained(
+        path, local_files_only=True, dtype=dtype, attn_implementation="sdpa",
+    ).to(cfg.run.device).eval()
+    if model.config.model_type != "qwen3" or model.config.hidden_size != 2560:
+        raise AdapterUnavailable("Unexpected Qwen3-4B model shape")
+    if profile.max_total_context > model.config.max_position_embeddings or profile.rope_scaling:
+        raise AdapterUnavailable("Native context/RoPE may not be overridden")
+    return model, tokenizer

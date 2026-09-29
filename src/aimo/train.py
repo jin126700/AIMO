@@ -124,6 +124,8 @@ def _split_label_counts(
     dataset: PageDataset, cfg: Config, stats: NormStats
 ) -> dict[str, int]:
     """model forward 없이 split 전체의 항별 유효 원문 수를 셉니다."""
+    # Collated supervision batches are CPU tensors; count with CPU scales.
+    stats = stats.to("cpu")
     micro = max(cfg.train.microbatch_originals, 1)
     counts: dict[str, int] = {}
     if cfg.train.task in ("behavior", "joint"):
@@ -337,6 +339,7 @@ def train(
     cfg: Config,
     datasets: dict[str, PageDataset],
     resume: bool = False,
+    guard=None,
 ) -> dict:
     """train split으로 학습하고 validation으로 checkpoint를 고릅니다."""
     run_dir = cfg.run_dir
@@ -419,11 +422,15 @@ def train(
     supervision_seen = {"pair_drop": False, "robust": False, "max_drop": False}
 
     for epoch in range(start_epoch, cfg.train.max_epochs):
+        if guard is not None and guard.should_stop()[0]:
+            break
         started = time.time()
         model.train()
         order = torch.randperm(n_groups, generator=sampler).tolist()
         epoch_total, epoch_weight = 0.0, 0.0
         for group_chunk in _chunk(order, batch_size):
+            if guard is not None and guard.should_stop()[0]:
+                raise RuntimeError("Experiment budget stopped training")
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
             groups = [train_set.groups[i] for i in group_chunk]
@@ -589,7 +596,7 @@ def _rng_state() -> dict:
     state = {
         "torch_cpu": torch.get_rng_state(),
         "python": random.getstate(),
-        "numpy": numpy.random.get_state(),
+        "numpy": (lambda x: (x[0], x[1].tolist(), *x[2:]))(numpy.random.get_state()),
         "cuda": None,
         "cuda_verified": False,
     }

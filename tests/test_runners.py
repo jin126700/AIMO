@@ -469,3 +469,51 @@ def test_parquet_is_read_in_batches_with_selected_columns(tmp_path):
     assert rows[0].n_r1_solutions == 1
     assert not hasattr(rows[0], "r1_solution_1")
     assert rows[0].as_metadata()["difficulty_scale"] == "deepmath_native"
+
+def test_durable_slots_keep_cached_after_stop_and_reject_identity(tmp_path):
+    from aimo.adapters.qwen import MockGenerationBackend
+    from aimo.collect import collect_outcomes
+    backend = MockGenerationBackend(responses())
+    ledger = DedupLedger.open(tmp_path)
+    first = collect_outcomes(backend, [plan()], calibrated(), ledger=ledger, policy_hash='p')
+    stop = StopRequest(); stop.request('stop')
+    guard = BudgetGuard(GpuBudget.open(tmp_path), stop=stop); guard.start()
+    second = collect_outcomes(MockGenerationBackend({}), [plan()], calibrated(), ledger=ledger, guard=guard, policy_hash='p')
+    assert second.outcomes[0].counts == first.outcomes[0].counts
+    assert len(list((tmp_path / 'slots').glob('*.json'))) == 4
+    with pytest.raises(ValueError, match='identity mismatch'):
+        collect_outcomes(backend, [plan()], calibrated(), ledger=ledger, policy_hash='changed')
+
+
+def test_started_slot_is_unresolved_without_regeneration(tmp_path):
+    import json
+    from aimo.adapters.qwen import MockGenerationBackend
+    from aimo.collect import collect_outcomes
+    ledger = DedupLedger.open(tmp_path)
+    collect_outcomes(MockGenerationBackend(responses()), [plan()], calibrated(), ledger=ledger, policy_hash='p')
+    path = next((tmp_path / 'slots').glob('*.json'))
+    raw=json.loads(path.read_text()); raw={'identity':raw['identity'],'state':'started'}
+    path.write_text(json.dumps(raw))
+    backend=MockGenerationBackend(responses())
+    result=collect_outcomes(backend,[plan()],calibrated(),ledger=ledger,policy_hash='p')
+    assert not backend.calls
+    assert result.outcomes[0].counts['U_score'] == 1
+
+def test_page_saved_before_ledger_and_missing_file_reextracts(tmp_path):
+    from aimo.adapters.qwen import build_tiny_qwen, ExtractionRequest, run_page_extraction, select_landmarks
+    tiny=build_tiny_qwen(hidden_size=16,n_layers=2,n_heads=2)
+    tokens=torch.tensor([[1,2,3,4,5,6]])
+    offsets,valid,rel=select_landmarks([1,2,3],6)
+    request=ExtractionRequest('o','v',tokens,offsets,valid,rel)
+    ledger=DedupLedger.open(tmp_path)
+    pages,first=run_page_extraction(tiny.model,[request],ledger=ledger,provenance={'policy_hash':'a'})
+    assert first['extracted']==1
+    files=list((tmp_path/'page_artifacts').glob('*.npz'))
+    assert len(files)==1 and files[0].with_suffix('.sha256').exists()
+    _,cached=run_page_extraction(tiny.model,[request],ledger=ledger,provenance={'policy_hash':'a'})
+    assert cached['skipped']==1
+    files[0].unlink()
+    _,restored=run_page_extraction(tiny.model,[request],ledger=ledger,provenance={'policy_hash':'a'})
+    assert restored['extracted']==1 and files[0].exists()
+    _,changed=run_page_extraction(tiny.model,[request],ledger=ledger,provenance={'policy_hash':'b'})
+    assert changed['extracted']==1

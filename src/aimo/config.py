@@ -228,6 +228,8 @@ class ThinkingProfileConfig:
     """
 
     model_id: str = "Qwen/Qwen3-4B"
+    model_revision: str | None = None
+    model_path: str | None = None
     enable_thinking: bool = True
     do_sample: bool = True
     temperature: float = 0.6
@@ -321,8 +323,8 @@ class DeepMathConfig:
 @dataclass
 class ServerConfig:
     repo_root: str = "/data1/HKM/AIMO"
-    input_root: str = "/data1/HKM/data"
-    output_root: str = "/data1/HKM/result/AIMO/HKM/aimo_v2"
+    input_root: str = "/data1/Data/AIMO/Datasets"
+    output_root: str = "/data1/HKM/result/AIMO"
     model_id: str = "Qwen/Qwen3-4B"
     tiny_config: bool = True  # CPU 검증에서는 random-init tiny config만 사용합니다.
     gpu_block_minutes: int = 175

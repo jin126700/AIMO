@@ -90,127 +90,95 @@ def token_prefix_hash(token_ids: list[int] | None) -> str:
 
 
 def collect_outcomes(
-    backend,
-    plans: list[CollectionPlan],
-    profile,
-    *,
-    ledger: DedupLedger | None = None,
-    guard: BudgetGuard | None = None,
-    policy_hash: str = "",
-    scorer_version: str = SCORER_VERSION,
-    special_token_ids: frozenset[int] | set[int] = frozenset(),
-) -> CollectionReport:
-    """계획된 slot을 실행해 PromptOutcome 목록을 만듭니다.
-
-    이미 ledger에 기록된 slot은 다시 실행하지 않고 저장된 outcome을 재사용합니다. 예산
-    초과나 중단 요청이 오면 남은 slot을 `not_started`로 남기고 부분 결과를 돌려줍니다.
-    """
-    pending = profile.needs_calibration()
-    if pending:
-        raise ValueError(
-            f"thinking profile is not calibrated yet ({pending}); collection must not start "
-            "with an unfrozen protocol"
-        )
+    backend, plans, profile, *, ledger=None, guard=None, policy_hash="",
+    scorer_version=SCORER_VERSION, special_token_ids=frozenset(),
+):
+    """Durable slot state: started -> raw evidence -> completed ledger; never retry started slots."""
+    from dataclasses import asdict
+    from pathlib import Path
+    from .runtime import atomic_write_json, store_lock
+    from .adapters.qwen import SlotResult
+    if profile.needs_calibration():
+        raise ValueError("thinking profile not calibrated")
     report = CollectionReport(outcomes=[])
-    stopped = False
+    all_ids = [sid for p in plans for sid in p.slot_ids]
+    if len(all_ids) != len(set(all_ids)):
+        raise ValueError("Slot IDs must be globally unique")
+    def stop():
+        return guard is not None and guard.should_stop()[0]
+    backend.stop_check = stop
     for plan in plans:
         counts = dict.fromkeys(OUTCOMES, 0)
-        completed = 0
-        evidence: dict[str, dict] = {}
-        for slot_id, seed in zip(plan.slot_ids, plan.seeds, strict=True):
-            if stopped:
-                counts[OUTCOME_NOT_STARTED] += 1
-                continue
-            if guard is not None:
-                hit, why = guard.should_stop()
-                if hit:
-                    stopped = True
+        evidence = {}
+        for sid, seed in zip(plan.slot_ids, plan.seeds, strict=True):
+            identity = {"request_id": sid, "seed": seed, "prompt_hash": prompt_hash(plan.prompt),
+                        "policy_hash": policy_hash, "scorer_version": scorer_version,
+                        "model_hash": getattr(backend, "model_hash", "mock"),
+                        "gold_hash": prompt_hash(plan.gold)}
+            rendered = backend.render(plan.prompt) if hasattr(backend, "render") else None
+            if rendered is not None:
+                identity["input_token_hash"] = hashlib.sha256(
+                    json.dumps(rendered["input_ids"][0].tolist()).encode()).hexdigest()
+            root = ledger.path.parent / "slots" if ledger is not None else None
+            path = root / (hashlib.sha256(sid.encode()).hexdigest() + ".json") if root else None
+            def work():
+                if path is not None and path.exists():
+                    raw = json.loads(path.read_text())
+                    if raw["identity"] != identity:
+                        raise ValueError("Cached slot identity mismatch: " + sid)
+                    if raw["state"] == "started":
+                        raw.update(state="interrupted", outcome="U_score", termination="interrupted")
+                        atomic_write_json(path, raw)
+                    report.skipped_slots += 1
+                    return raw
+                if ledger is not None and ledger.seen(sid):
+                    raise ValueError("Legacy ledger without durable evidence: " + sid)
+                if stop():
                     report.stopped = True
-                    report.stop_reason = why
-                    counts[OUTCOME_NOT_STARTED] += 1
-                    continue
-            cached = _cached_slot(ledger, slot_id)
-            if cached is not None:
-                counts[cached["outcome"]] += 1
-                completed += 1 if cached["outcome"] != OUTCOME_NOT_STARTED else 0
-                evidence[slot_id] = cached["evidence"]
-                report.skipped_slots += 1
-                continue
-            request = SlotRequest(
-                prompt_id=plan.prompt_id,
-                slot_id=slot_id,
-                prompt=plan.prompt,
-                gold=plan.gold,
-                seed=seed,
-                is_final_cap=plan.is_final_cap,
-                thinking_already_open=plan.thinking_already_open,
-            )
-            try:
-                result = backend.generate(request)
-            except Exception as exc:  # noqa: BLE001 - backend 오류를 그대로 전달합니다
-                report.errors.append(f"{slot_id}: {type(exc).__name__}: {exc}")
-                counts["infra_error"] += 1
-                completed += 1
-                continue
-            if result.started and not result.infra_error:
-                # 총 context는 prompt + generated로 검사합니다 (조용히 truncate하지 않습니다).
+                    report.stop_reason = guard.should_stop()[1]
+                    return {"outcome": "not_started", "identity": identity}
+                raw = {"identity": identity, "state": "started"}
+                if path is not None:
+                    atomic_write_json(path, raw)
+                request = SlotRequest(plan.prompt_id, sid, plan.prompt, plan.gold, seed,
+                                      plan.is_final_cap, plan.thinking_already_open)
                 try:
-                    check_total_context(
-                        result.prompt_tokens,
-                        result.generated_tokens,
-                        profile.max_total_context,
-                    )
-                except ValueError as exc:
-                    report.errors.append(f"{slot_id}: {exc}")
-                    counts["infra_error"] += 1
-                    completed += 1
-                    continue
-            outcome = classify_thinking_slot(
-                started=result.started,
-                infra_error=result.infra_error,
-                hit_cap=result.hit_cap,
-                is_final_cap=plan.is_final_cap,
-                text=result.text,
-                gold=plan.gold,
-                thinking_already_open=result.thinking_already_open
-                or plan.thinking_already_open,
-                generated_token_ids=result.generated_token_ids,
-                special_token_ids=special_token_ids,
-            )
-            counts[outcome] += 1
-            if outcome != OUTCOME_NOT_STARTED:
-                completed += 1
-            slot_evidence = {
-                "request_id": slot_id,
-                "seed": seed,
-                "prompt_hash": prompt_hash(plan.prompt),
-                "policy_hash": policy_hash,
-                "token_prefix_hash": token_prefix_hash(result.generated_token_ids),
-            }
-            evidence[slot_id] = slot_evidence
-            report.executed_slots += 1
-            if ledger is not None:
-                ledger.mark(slot_id, {"outcome": outcome, "evidence": slot_evidence})
-        report.outcomes.append(
-            PromptOutcome(
-                prompt_id=plan.prompt_id,
-                counts=counts,
-                planned_trials=plan.planned_trials,
-                completed_trials=completed,
-                termination_reason="stopped" if stopped else "completed",
-                policy_hash=policy_hash,
-                scorer_version=scorer_version,
-                slot_evidence=evidence,
-            )
-        )
+                    result = backend.generate(request)
+                    check_total_context(result.prompt_tokens, result.generated_tokens,
+                                        profile.max_total_context)
+                except Exception as exc:
+                    result = SlotResult(sid, infra_error=True, error_message=str(exc),
+                                        termination_reason="infra_error")
+                    report.errors.append(sid + ": " + str(exc))
+                outcome = classify_thinking_slot(
+                    started=result.started, infra_error=result.infra_error, hit_cap=result.hit_cap,
+                    is_final_cap=plan.is_final_cap, text=result.text, gold=plan.gold,
+                    thinking_already_open=result.thinking_already_open or plan.thinking_already_open,
+                    generated_token_ids=result.generated_token_ids, special_token_ids=special_token_ids)
+                if result.termination_reason == "external_stop":
+                    outcome = "U_score"
+                raw.update(state="completed", outcome=outcome, result=asdict(result),
+                           termination=result.termination_reason,
+                           scorer={"gold": plan.gold, "version": scorer_version,
+                                   "outcome": outcome})
+                if path is not None:
+                    atomic_write_json(path, raw)
+                if ledger is not None:
+                    ledger.mark(sid, {"outcome": outcome, "evidence": identity,
+                                      "artifact": str(path)})
+                report.executed_slots += 1
+                return raw
+            if path is not None:
+                with store_lock(path):
+                    raw = work()
+            else:
+                raw = work()
+            counts[raw["outcome"]] += 1
+            evidence[sid] = {**{k: identity[k] for k in ("request_id", "seed", "prompt_hash", "policy_hash")}, "token_prefix_hash": token_prefix_hash(
+                raw.get("result", {}).get("generated_token_ids"))}
+        report.outcomes.append(PromptOutcome(
+            prompt_id=plan.prompt_id, counts=counts, planned_trials=plan.planned_trials,
+            completed_trials=plan.planned_trials-counts["not_started"],
+            termination_reason="stopped" if report.stopped else "completed",
+            policy_hash=policy_hash, scorer_version=scorer_version, slot_evidence=evidence))
     return report
-
-
-def _cached_slot(ledger: DedupLedger | None, slot_id: str) -> dict | None:
-    """ledger에 이미 기록된 slot 결과를 돌려줍니다 (resume용)."""
-    if ledger is None or not ledger.seen(slot_id):
-        return None
-    payload = ledger.payload(slot_id)
-    if not payload or "outcome" not in payload:
-        return None
-    return {"outcome": payload["outcome"], "evidence": payload.get("evidence", {})}

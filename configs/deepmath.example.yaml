@@ -10,14 +10,14 @@ paths:
   # dataset 기본 경로. 로컬에서 존재 여부를 확인하거나 만들지 않습니다.
   input_root: /data1/Data/AIMO/Datasets
   # result는 <output_root>/<run_id>/ 아래에 남습니다.
-  output_root: /data1/HKM/result/AIMO/HKM/aimo_v2
+  output_root: /data1/HKM/result/AIMO
 
 data:
   source: deepmath
-  page_dir: /data1/HKM/result/AIMO/HKM/aimo_v2/pages
-  label_path: /data1/HKM/result/AIMO/HKM/aimo_v2/labels.json
-  pair_path: /data1/HKM/result/AIMO/HKM/aimo_v2/frozen_pairs.json
-  outcome_path: /data1/HKM/result/AIMO/HKM/aimo_v2/outcomes.json
+  page_dir: /data1/HKM/result/AIMO/pages
+  label_path: /data1/HKM/result/AIMO/labels.json
+  pair_path: /data1/HKM/result/AIMO/frozen_pairs.json
+  outcome_path: /data1/HKM/result/AIMO/outcomes.json
   robust_policy:
     enabled: false
     definition_id: null
@@ -32,8 +32,8 @@ train:
 
 server:
   repo_root: /data1/HKM/AIMO
-  input_root: /data1/HKM/data
-  output_root: /data1/HKM/result/AIMO/HKM/aimo_v2
+  input_root: /data1/Data/AIMO/Datasets
+  output_root: /data1/HKM/result/AIMO
   gpu_block_minutes: 175    # 누적 GPU-active 175분 이상이면 새 작업 시작을 막습니다
   gpu_stop_minutes: 180     # 진행 중이어도 180분에서 협조적으로 종료합니다
   gpu_budget_minutes: 180   # 기본 예산 3시간

@@ -50,7 +50,7 @@ pip install -e ".[server]"    # 서버 전용 optional 의존성
 ```
 repo:    /data1/HKM/AIMO
 dataset: /data1/Data/AIMO/Datasets
-output:  /data1/HKM/result/AIMO/HKM/aimo_v2/<run_id>/
+output:  /data1/HKM/result/AIMO/<run_id>/
 ```
 
 이 경로는 config와 example 문서에만 반영했습니다. 로컬에서 존재 여부를 확인하거나 만들지
@@ -186,3 +186,15 @@ transformers 조건까지 함께 봅니다 (`gpu_blockers`로 이유를 나열�
 6. 실행 환경·policy·Page가 바뀌면 hash가 달라집니다. 공식 모델 parameter가 다르다는 이유로
    global environment를 일괄 upgrade하지 않습니다. 이번 작업에서 서버 파일을 삭제하지
    않았습니다.
+
+## 9. DeepMath real-data server patch (2026-09-27)
+
+- 실제 Qwen3-4B local snapshot과 request별 RNG/stop을 연결했습니다. `ThinkingProfileConfig`의 `model_revision`과 `model_path`를 고정합니다.
+- `aimo deepmath-real --stage prepare --run-dir <existing-root>`는 prepared inputs/answers/candidates/pairs/splits를 재사용하며 token identity를 검사합니다.
+- 실제 extract는 `--requests`의 frozen rendered input IDs가 필요합니다. random tokens는 `--tiny` 전용입니다.
+- collection은 started 상태와 원시 text/token/scorer 근거를 durable 저장하고, prompt/model/policy/scorer/seed 불일치 cache를 거부합니다. interrupted slot은 재생성하지 않습니다.
+- Page는 atomic 파일 및 checksum 저장 후 완료 처리하며, 파일 없는 ledger를 skip 근거로 쓰지 않습니다.
+- `aimo deepmath-real --stage calibration --execute-gpu --run-dir <existing-root>`는 기존 audit가 있으면 네 owned worker를 공유 budget supervisor로 재개합니다. 모든 slots가 기록됐으면 GPU를 시작하지 않고 집계합니다.
+- `aimo deepmath-real --stage finish --run-dir <existing-root>`는 실제 calibration 비용상 최소 학습 cohort조차 불가능할 때 DATA/PROTOCOL_LIMIT을 기록합니다. 가능할 때는 거짓 종료하지 않고 오류를 냅니다.
+- 이 patch는 본실험 학습 완료를 의미하지 않습니다. 실행 결과는 repository root의 Loop_result.md와 해당 result manifest가 근거입니다.
+- CPU 회귀 및 실제 CUDA 진단은 result/protocol에 보존합니다. PyTorch 2.7에서 NumPy RNG는 기본 자료형으로 checkpoint에 저장합니다.
