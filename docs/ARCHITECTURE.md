@@ -29,6 +29,138 @@ CUDA_VISIBLE_DEVICES=0 python -m aimo flow-representation-experiment --run-dir /
 둘째 명령은 기존 predictor만 학습한다. 기존 source 결과는 읽기 전용이다.
 source/control hashes와 독립 run의 config를 보존하고 automatic push를 하지 않는다.
 
+## Current candidate primary: LRT-v1 (Looped Relational Transport)
+
+상태: `IMPLEMENTED / CPU-VALIDATED / SERVER-UNTESTED`. 아래 historical section은 그대로
+보존하며, server 결과가 없는 상태에서 LRT를 validated/successful이라고 쓰지 않는다.
+
+### 좌표: MacroPage-8 (derived view)
+
+Fine Page가 source of truth이고 바뀌지 않는다. MacroPage는 runtime에 deterministic하게
+만드는 derived view다 (`src/aimo/macro_page.py`).
+
+```
+b_g              = floor(g * L / G),  g = 0..G,  G <= L,  strictly increasing
+S[g, p]          = fine.state[b_g, p]                          [G+1, P, H]
+U_macro[g, p, c] = sum_{l=b_g}^{b_{g+1}-1} fine.updates[l,p,c]  [G, P, 2, H]
+S[g+1]           = S[g] + U_macro[g,:,0] + U_macro[g,:,1]       (source tolerance 안)
+```
+
+layer 수를 hard-code하지 않으므로 24 / 32 / 36 / 48 layer 모두 같은 G=8 coordinate를 쓴다.
+fingerprint는 `source_page_fingerprint` + `macro_schema` + `n_macro` + `boundaries`를 담고,
+같은 Fine Page + 같은 G이면 같은 값이다. source Page는 mutate하지 않는다.
+
+`path_energy[g,p,c] = Σ_l ||fine.update[l,p,c]||₂`는 macro sum의 cancellation을 보는
+**diagnostic 전용**이며 encoder input / decoder / training loss에 들어가지 않는다.
+
+### Relation target
+
+```
+ΔU[g, p, c] = V.updates[g,p,c] - O.updates[g,p,c]
+```
+
+encoder가 보는 primary activation은 ΔU뿐이다. 누적량 `V.state - O.state`는 앞선 macro
+relation의 누적이고 held-out macro 정보의 indirect trace가 될 수 있으므로 encoder input으로
+쓰지 않는다. absolute original state/update는 decoder context에서만 쓴다.
+
+### Support / Query fold
+
+G=8의 query fold는 연속 macro pair다: `[0,1] [2,3] [4,5] [6,7]`. 나머지 6 macro가 support이고
+각 pair에 대해 4 fold를 rotate한다. **future prediction이 아니다** — support에는 query보다
+뒤의 macro가 들어갈 수 있으므로 이름은 cross-macro relational transport이며 causal transport라고
+쓰지 않는다.
+
+### 모델 (`src/aimo/lrt.py`)
+
+```
+A_U : H -> 32   (Mixer/FFN relation과 original update가 공유. stream embedding으로 구분)
+A_S : H -> 32   (original state)
+
+relation cell = cell_proj(A_U(ΔU_norm[g,p,c])) + site(depth, landmark, stream, position)
+x_{k+1}       = Block(x_k + inject(x_0))          동일 SharedBlock 객체 4회 호출
+z_rel         = Linear(128, 16)(LN(valid-mask mean pooling))         -> R^16
+
+a[g,p,c]      = coeff(z_rel, A_S(O.state[g,p]), A_U(O.updates[g,p,c]), site)   -> R^16
+ΔU_hat[g,p,M] = B_M(a),   ΔU_hat[g,p,F] = B_F(a)      B_c = Linear(16, H, bias=False)
+```
+
+`d_model 128 / heads 4 / FFN 256 / dropout 0.1 / loops 4 / relation_dim 16 / decoder_rank 16`.
+site metadata embedding은 std 0.02로 초기화한다 (기본 `nn.Embedding` std 1.0은 adapter를 지난
+relation 신호를 약 9배로 압도해 LayerNorm 뒤에 relation 내용이 묻힌다).
+
+low-rank 의미:
+
+```
+historical U4-like :  ΔU ≈ P z                      (original computation과 무관한 fixed 변환)
+LRT-v1             :  ΔU_hat = B_c g(z_rel, O.state, O.update, site)
+```
+
+low-dimensional output subspace를 유지하면서 relation code / state 의존 / site 의존을 허용하되,
+full H-space arbitrary nonlinear reconstruction은 허용하지 않는다.
+
+### Loss
+
+```
+E_pred = Σ_valid ||ΔU_norm - ΔU_hat_norm||²
+E_zero = Σ_valid ||ΔU_norm||²
+R      = E_pred / max(E_zero, τ)          Zero predictor는 R = 1
+
+L = L_transport + 0.1 * L_consistency
+L_transport   = original-balanced mean R   (variants/folds를 original 안에서 먼저 평균)
+L_consistency = 1 - cosine(z1, z2)         (독립 support cell dropout 0.1 두 view)
+```
+
+τ(`denominator_floor`)는 server audit의 frozen 값이어야 하고 null이면 real run이 fail-fast한다.
+held-out 결과를 보고 조정하지 않는다. behavior loss / Flow next loss / energy loss / InfoNCE /
+negative contrastive / recipe classification은 넣지 않는다. InfoNCE를 쓰지 않는 이유는 다른
+pair가 실제 negative라는 보장이 없기 때문이다 (서로 다른 문제에 같은 transformation family가
+있을 수 있다).
+
+### Normalization과 checkpoint
+
+`MacroNormStats`는 **train originals만**으로 fit한다 (`state_scale [G+1]`,
+`update_scale [G,2]`). variant delta 분포를 먼저 보고 scale을 정하지 않고 validation/test Page
+통계를 쓰지 않는다. LRT checkpoint schema는 `aimo-lrt-v1`이며 old Flow/Behavior checkpoint를
+LRT로 load하지 못한다.
+
+### Baselines와 control
+
+| 이름 | 정의 |
+| --- | --- |
+| `zero` | `ΔU_hat = 0`, transport ratio 1 |
+| `train_mean` | train originals의 macro × stream relation mean |
+| `rank4_linear_transport` | train-only rank-4 native basis(SVD) + support 투영 coefficient. **historical U4 재현이 아님** |
+| E-FLOW-1 raw Flow | 기존 legacy result/interface 보존 |
+| `lrt_v1` | 위 architecture |
+
+support-swap: 평가 pair `i`의 query를 다른 original `j`의 `z_j`로 예측한다. donor는 same pair
+금지, 가능하면 same original 금지, outcome/label 기반 선택 금지, eval seed로 deterministic.
+`swap_gap = E_swap - E_correct > 0`은 relation representation을 실제로 쓴다는 evidence이며
+causal evidence가 아니다.
+
+### Parameter (실측)
+
+`d_model 128 / adapter 32 / relation 16 / decoder_rank 16` 기준.
+
+| component | toy `H=8, P=4` | 예시 `H=2560, P=17` |
+| --- | --- | --- |
+| update_adapter | 288 | 81,952 |
+| state_adapter | 288 | 81,952 |
+| relation_embeddings | 23,040 | 24,704 |
+| shared_block | 132,480 | 132,480 |
+| relation_projection | 2,320 | 2,320 |
+| coefficient_network | 14,416 | 14,416 |
+| mixer_basis / ffn_basis | 128 / 128 | 40,960 / 40,960 |
+| **total** | **173,088** | **419,744** |
+| (Flow loop4 total 비교) | 159,752 | 1,470,592 |
+
+Macro8이 parameter를 자동으로 4배 줄이는 것은 **아니다**. Macro는 depth 길이와 relation
+sequence 크기, attention compute를 줄인다. real scale에서 total이 줄어드는 것은 low-dimensional
+native adapter(H→32)와 rank-16 native basis가 IO parameter를 줄이기 때문이다
+(Flow io 1,007,616 → LRT adapter+basis 245,824).
+
+---
+
 # ARCHITECTURE
 
 확정된 v2 architecture(**Behavior-supervised Looped Transformer + Flow auxiliary**)의

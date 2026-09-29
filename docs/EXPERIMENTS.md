@@ -29,6 +29,77 @@ CUDA_VISIBLE_DEVICES=0 python -m aimo flow-representation-experiment --run-dir /
 둘째 명령은 기존 predictor만 학습한다. 기존 source 결과는 읽기 전용이다.
 source/control hashes와 독립 run의 config를 보존하고 automatic push를 하지 않는다.
 
+## Next server experiment gate: LRT-v1 transport
+
+상태: `IMPLEMENTED / CPU-VALIDATED / SERVER-UNTESTED`. 아래는 **다음 단계에서 실행할** gate이며
+아직 실행하지 않았다.
+
+### 준비 (로컬에서 이미 완료)
+
+- MacroPage-8 derived view, LRT-v1 model/loss, baselines, support-swap control, CPU toy A/B,
+  `audit-macro-page` / `lrt-experiment` CLI.
+- CPU toy 결과는 architecture plumbing sanity이며 real-data evidence가 아니다.
+
+### Gate 0 — frozen τ (`denominator_floor`)
+
+real run 전에 server audit에서 τ를 확정해야 한다. 후보:
+
+1. 같은 prompt를 반복 추출한 FP32 Page의 numerical noise 수준
+2. 사전에 정의한 train-only rule
+
+**held-out 결과를 보고 τ를 조정하지 않는다.** τ가 null이면 `resolve_floor`가 fail-fast한다.
+
+### Gate 1 — Fine vs Macro bridge
+
+```sh
+python -m aimo audit-macro-page --run-dir <audit_run> --source <frozen_fp32_page_store>
+```
+
+보고 항목: macro residual identity, boundaries, fine/macro relation energy와 그 비율,
+path-energy cancellation diagnostic, `all_common` vs `final_token` landmark 수,
+(rank4 baseline이 있으면) Fine vs Macro transport 비교.
+
+이 audit은 MacroPage가 U4 signal을 유지한다는 **증명이 아니다**. Macro compression이 signal을
+죽이는지 실제 Page에서 판단하기 위한 interface다.
+
+### Gate 2 — transport ratio
+
+같은 frozen split(original-group split, 같은 original의 variants는 한 split에만)에서 다음을
+같은 조건으로 비교한다.
+
+| 비교군 | 기대 |
+| --- | --- |
+| `zero` | R = 1 (기준선) |
+| `train_mean` | 참고값 |
+| `rank4_linear_transport` | low-rank 선형 transport가 얼마나 설명하는지 |
+| E-FLOW-1 raw Flow | historical negative baseline (0.744428 vs Zero 0.742116) |
+| `lrt_v1` | **R < 1** 이어야 gate 통과 |
+
+LRT가 Zero보다 좋지 않으면 transport representation이 확립되지 않은 것으로 보고한다
+(E-FLOW-1과 같은 방식의 negative 판정).
+
+### Gate 3 — support-swap control
+
+`swap_gap = E_swap - E_correct > 0`. donor는 same pair 금지, 가능하면 same original 금지,
+outcome/label 기반 선택 금지, eval seed로 deterministic. swap_gap > 0은 relation representation을
+실제로 쓴다는 evidence이며 **causal evidence가 아니다**.
+
+### Gate 4 — landmark mode diagnostic
+
+`all_common`(primary train)과 `final_token`을 모두 보고한다. 두 결과 차이는 original/variant
+landmark ordinal alignment가 noise source인지 진단하는 용도이며, 이것을 보고 v1 architecture를
+자동으로 바꾸지 않는다.
+
+### 이번 단계에서 하지 않는 것
+
+robustness classifier, official `is_robust` probe, pair-drop regression 변경, diagnostic variant
+generator, ensemble disagreement, multi-trait predictor, cross-model shared training,
+model-held-out experiment, response trajectory, attention-specific Qwen feature,
+DeltaNet-specific Page, activation patching, DAS, SAE, InfoNCE, large hyperparameter sweep.
+모두 LRT transport gate를 통과한 뒤의 일이다.
+
+---
+
 # EXPERIMENTS
 
 Stage 1의 dataset, split, screening, 비교군, metrics, 실험 순서를 정리합니다.

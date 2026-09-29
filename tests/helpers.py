@@ -40,3 +40,38 @@ def tiny_payload(**overrides) -> dict:
             else:
                 node[key] = value
     return payload
+
+
+def fine_page(
+    n_blocks: int = 32,
+    n_landmarks: int = 4,
+    hidden: int = 8,
+    seed: int = 0,
+    *,
+    variant: bool = False,
+    invalid: tuple[int, ...] = (),
+):
+    """residual identity를 정확히 만족하는 Fine Page fixture (MacroPage/LRT test 공용)."""
+    import torch
+
+    from aimo.page import Page
+
+    generator = torch.Generator().manual_seed(seed)
+    updates = torch.randn(n_blocks, n_landmarks, 2, hidden, generator=generator) * 0.3
+    state = torch.zeros(n_blocks + 1, n_landmarks, hidden)
+    state[0] = torch.randn(n_landmarks, hidden, generator=generator)
+    for depth in range(n_blocks):
+        state[depth + 1] = state[depth] + updates[depth].sum(dim=1)
+    valid = torch.ones(n_landmarks, dtype=torch.bool)
+    for index in invalid:
+        valid[index] = False
+    return Page(
+        state=state,
+        updates=updates,
+        valid=valid,
+        token_offsets=torch.arange(n_landmarks, dtype=torch.long),
+        relative_positions=torch.linspace(0.0, 1.0, n_landmarks),
+        original_id="o",
+        variant_id="o#v1" if variant else "o#orig",
+        provenance={"source": "synthetic"},
+    )

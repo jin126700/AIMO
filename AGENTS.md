@@ -1,33 +1,82 @@
-## Current primary: Flow representation learning → frozen robustness probe
+## Current primary candidate: LRT-v1 (Looped Relational Transport)
 
-현재 primary는 **E-FLOW-1**이다. 직전 FP32 behavior regression의 전체 81 valid pairs 중
-77개가 zero-drop이었고, known-test 10 originals / 19 pairs에서 zero baseline이 Joint보다
-우수했다. 이것은 architecture 자체의 실패를 입증하지 않는다.
+현재 primary candidate는 **LRT-v1**이며 상태는
+`IMPLEMENTED / CPU-VALIDATED / SERVER-UNTESTED`이다. server 결과 없이 validated 또는
+successful이라고 쓰지 않는다.
 
-- Stage 1: 행동 label 파일을 읽지 않는 Page-only loader. 기존 train의 ID hash로
-  flow_train 28 / flow_dev 4를 freeze한다. Flow normalization은 flow_train만 사용한다.
-- Shared LoopedCore ×4, d_model128 / heads4 / FFN256 / dropout0.1을 유지한다.
-  objective는 L_next + L_within + 0.25 L_roll이며 flow_dev L_flow로 checkpoint를 선택한다.
-- Stage 2: encoder 완전 동결, full-page observed valid hidden mask-mean z128,
-  panel mean/std256 (population std; singleton std0). 새로운 pair query/head는 없다.
-- Zero/train-mean Flow baseline, original-only M0, RawChange, random-init core,
-  train original-label shuffle20회와 작은 L2 logistic probe를 비교한다.
-- 실데이터에서 검증된 criterion이 없으면 threshold를 만들지 않는다.
-  class 또는 criterion 부족은 ROBUSTNESS_PROBE_DATA_LIMIT이며 BCE/AUROC/bootstrap을
-  강제로 실행하지 않는다. feature extraction과 Flow validation/diagnostics는 진행한다.
-- Flow decodability ≠ robustness; robustness prediction/probe separability ≠ causal mechanism.
-  representation stability ≠ robustness. activation patching 이전에는 causal evidence를 주장하지 않는다.
-- 아래 Behavior-primary / joint / legacy 지침은 **historical v2 baseline**에 적용한다.
-  기존 Behavior head와 loss는 삭제하지 않는다. 이 E-FLOW-1 정의가 현재 primary에 우선한다.
+### 연구 history (수정하거나 성공으로 재해석하지 않는다)
 
-실행:
-```sh
-python -m aimo flow-representation-experiment --source /path/to/frozen_fp32_run --run-dir /path/to/new_run
-CUDA_VISIBLE_DEVICES=0 python -m aimo flow-representation-experiment --run-dir /path/to/new_run --execute-gpu
+| 단계 | 결과 | 판정 |
+| --- | --- | --- |
+| Behavior v2 | held-out pair-drop에서 zero baseline이 Joint보다 우수. 전체 valid pair의 대부분이 zero-drop | negative real-data result. direct pair-drop regression은 primary에서 제외 |
+| E-FLOW-1 | Zero Flow error 0.742116, train-mean 0.752784, learned Flow 0.744428. learned가 train-mean보다 좋지만 Zero보다 나쁨 | `FLOW_REPRESENTATION_NOT_ESTABLISHED` |
+| Robustness probe | verified binary robustness criterion 부재, 실제 probe 학습 미실행 | `ROBUSTNESS_PROBE_DATA_LIMIT` |
+
+LRT-v1은 위 negative result를 해결하려는 새 candidate다. E-FLOW-1은 historical negative
+baseline으로 보존하며 semantics를 바꾸지 않는다.
+
+### LRT-v1이 묻는 질문
+
+original→variant relation의 일부 computation site를 보고 만든 저차원 relational state
+`z_rel`이, **보지 않은** computation site의 relation을 설명할 수 있는가.
+
 ```
-첫 명령은 Page audit와 split/spec freeze이며 GPU inference를 하지 않는다.
-둘째 명령은 기존 predictor만 학습한다. 기존 source 결과는 읽기 전용이다.
-source/control hashes와 독립 run의 config를 보존하고 automatic push를 하지 않는다.
+Support relation  ->  z_rel (R^16)  ->  Held-out relation
+```
+
+- 이 실험은 future prediction이 **아니다**. support에는 query보다 뒤의 macro가 포함될 수
+  있으므로 정확한 이름은 **cross-macro relational transport**(cross-site reconstruction)이며
+  causal transport라고 쓰지 않는다.
+- 이 Stage에서는 correctness / pair-drop / max-drop / robust label / perturbation recipe를
+  전혀 쓰지 않는다. data loader가 behavior label 파일을 요구하면 안 된다.
+- checkpoint 선택은 validation `L_transport`만 쓴다. behavior metric을 쓰지 않는다.
+
+### 좌표와 계약
+
+- **Fine Page는 source of truth이고 바꾸지 않는다.** `state [L+1,P,H]`, `updates [L,P,2,H]`,
+  stream 0=Mixer / 1=FFN, `P=17`, residual identity를 그대로 유지한다. `save_pages` /
+  `load_pages` / fingerprint / provenance / extractor를 수정하지 않는다. LRT 때문에 기존 Page
+  artifact를 다시 추출할 필요가 없다.
+- **MacroPage-8은 derived runtime view**다. `b_g = floor(g*L/G)`, `G <= L`, boundary strictly
+  increasing. layer 수를 hard-code하지 않으므로 24/32/36/48 모두 같은 G=8 coordinate를 쓴다.
+  macro residual identity는 source tolerance 안에서 유지된다.
+- `path_energy`는 **diagnostic 전용**이다. encoder input / decoder / training loss에 쓰지
+  않는다. Macro compression이 signal을 죽인다는 empirical evidence가 나온 뒤에만 승격한다.
+- stream 이름은 Mixer / Channel(FFN) 둘뿐이다. Attention / DeltaNet / SSM 같은 architecture
+  이름을 input feature로 넣지 않는다.
+
+### 절대 깨면 안 되는 것 (LRT)
+
+- encoder가 보는 primary activation은 `ΔU = V.updates - O.updates`뿐이다. 누적량
+  `V.state - O.state`를 encoder input으로 넣지 않는다.
+- **variant query update는 decoder input에 절대 들어가지 않는다.** decoder는 `z_rel`,
+  `O.state[g,p]`, `O.updates[g,p,c]`, site metadata만 본다. original query update는 target이
+  아니므로 leakage가 아니다.
+- landmark ordinal이 original/variant에서 같은 개념이라고 가정하지 않는다. `original.valid &
+  variant.valid`만 쓰고, `all_common`(primary train)과 `final_token`(mandatory diagnostic)
+  두 mode를 모두 지원한다. 두 결과를 보고 v1 architecture를 자동 변경하지 않는다.
+- normalization은 **train originals만**으로 fit한다. variant delta 분포를 먼저 보고 scale을
+  정하지 않고, validation/test Page 통계를 쓰지 않는다.
+- `denominator_floor` τ는 server audit의 frozen 값이어야 한다. null이면 real run이
+  fail-fast한다. held-out 결과를 보고 τ를 조정하지 않는다. CPU fixture만 explicit τ를 쓴다.
+- support-swap gap > 0은 relation representation을 실제로 사용한다는 evidence이며 **causal
+  evidence가 아니다**. panel 재정렬 불변성과도 구분한다.
+- `rank4_linear_transport`는 새로 정의한 baseline이며 **historical U4의 재현이 아니다**
+  (repo에 historical U4 구현이 없어 추측 재현을 하지 않았다).
+- LRT checkpoint schema는 `aimo-lrt-v1`이다. old Flow/Behavior checkpoint를 LRT로 load하지
+  못하게 한다.
+
+### 실행 (CPU)
+
+```sh
+python -m aimo audit-macro-page --run-dir /path/to/audit --source /path/to/page_store
+python -m aimo lrt-experiment  --run-dir /path/to/lrt                       # spec 출력
+python -m aimo lrt-experiment  --run-dir /path/to/lrt --toy B --toy-floor 1e-6
+```
+
+실제 FP32 Page 실험과 GPU 서버 실행은 다음 단계다. server/runtime 파일
+(`fp32_*`, `bf16_*`, `real_*`, `adapters/qwen.py`, `collect.py`, `runtime.py`)은 LRT에 필요한
+범위를 넘어 수정하지 않는다.
 
 # AGENTS.md
 

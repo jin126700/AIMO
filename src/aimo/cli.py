@@ -1280,6 +1280,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_real.add_argument("--execute-gpu", action="store_true")
     from .real_run import command
     p_real.set_defaults(func=command)
+    p_audit = sub.add_parser("audit-macro-page", help="Fine vs MacroPage-8 bridge audit")
+    p_audit.add_argument("--run-dir", required=True)
+    p_audit.add_argument("--source", default=None, help="Page store directory (index.json)")
+    p_audit.add_argument("--config", default=None)
+    p_audit.add_argument("--n-macro", type=int, default=None, help="G override (even, >= 4)")
+    from .lrt_experiment import audit_command
+
+    p_audit.set_defaults(func=audit_command)
+
+    p_lrt = sub.add_parser("lrt-experiment", help="LRT-v1 cross-macro relational transport")
+    p_lrt.add_argument("--run-dir", required=True)
+    p_lrt.add_argument("--config", default=None)
+    p_lrt.add_argument("--toy", choices=["A", "B"], default=None, help="CPU toy fixture 실행")
+    p_lrt.add_argument("--toy-floor", type=float, default=None, help="toy용 explicit τ")
+    p_lrt.add_argument("--max-epochs", type=int, default=200)
+    p_lrt.add_argument("--seed", type=int, default=0)
+    from .lrt_experiment import command as lrt_command
+
+    p_lrt.set_defaults(func=lrt_command)
+
     p_flow = sub.add_parser("flow-representation-experiment", help="E-FLOW-1 label-free Flow + frozen probe")
     p_flow.add_argument("--run-dir", required=True)
     p_flow.add_argument("--source", default=None)

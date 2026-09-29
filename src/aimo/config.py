@@ -338,6 +338,40 @@ class ServerConfig:
 
 
 @dataclass
+class LRTConfig:
+    """LRT-v1 (Looped Relational Transport) 전용 설정.
+
+    `denominator_floor`는 real experiment에서 반드시 server audit의 frozen 값이어야 합니다.
+    null이면 real run이 fail-fast합니다. held-out 결과를 보고 조정하지 않습니다.
+    """
+
+    n_macro: int = 8
+    adapter_dim: int = 32
+    d_model: int = 128
+    n_heads: int = 4
+    ffn_dim: int = 256
+    dropout: float = 0.1
+    n_loops: int = 4
+    relation_dim: int = 16
+    decoder_rank: int = 16
+    consistency_weight: float = 0.1
+    support_dropout: float = 0.1
+    denominator_floor: float | None = None
+    landmark_mode: str = "all_common"
+
+    def __post_init__(self) -> None:
+        if self.landmark_mode not in ("all_common", "final_token"):
+            raise ValueError(
+                f"lrt.landmark_mode must be 'all_common' or 'final_token', "
+                f"got {self.landmark_mode!r}"
+            )
+        if self.n_macro < 4 or self.n_macro % 2 != 0:
+            raise ValueError(f"lrt.n_macro must be an even number >= 4, got {self.n_macro}")
+        if not 0.0 <= self.support_dropout < 1.0:
+            raise ValueError("lrt.support_dropout must be in [0, 1)")
+
+
+@dataclass
 class Config:
     run: RunConfig = field(default_factory=RunConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
@@ -346,6 +380,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    lrt: LRTConfig = field(default_factory=LRTConfig)
 
     @property
     def run_dir(self) -> Path:

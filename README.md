@@ -35,6 +35,24 @@ original–variant pair의 **행동 변화**(correctness drop / robustness)를 �
 내부 변화 representation을 학습하는 연구 프로젝트입니다. 작은 Looped Transformer 하나가
 behavior 예측과 flow 예측을 함께 담당합니다.
 
+## 현재 primary candidate: LRT-v1
+
+`IMPLEMENTED / CPU-VALIDATED / SERVER-UNTESTED`. original→variant relation의 일부 computation
+site를 보고 만든 저차원 relational state `z_rel`(R^16)이 **보지 않은** computation site의
+relation을 설명할 수 있는지 검증한다 (cross-macro relational transport; future prediction이나
+causal transport가 아니다).
+
+- MacroPage-8은 Fine Page에서 만드는 derived view이며 Fine Page 계약을 바꾸지 않는다.
+- correctness / pair-drop / robust label / perturbation recipe를 쓰지 않는다.
+- 직전 결과는 보존한다: Behavior v2는 negative real-data result, E-FLOW-1은 learned Flow
+  0.744428 vs Zero 0.742116으로 `FLOW_REPRESENTATION_NOT_ESTABLISHED`,
+  robustness probe는 `ROBUSTNESS_PROBE_DATA_LIMIT`.
+- CPU toy 결과는 architecture plumbing sanity이며 real-data evidence가 아니다. 실제 FP32 Page
+  실험과 GPU 실행은 다음 단계다.
+
+자세한 내용은 [AGENTS.md](AGENTS.md)와 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
+[docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)에 있다.
+
 ## 1. 연구 목적
 
 **Primary (v2)**: robust/non-robust 또는 correctness drop의 행동 감독으로 유용한 내부 변화

@@ -41,3 +41,4 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["slow: CPU toy 학습처럼 수십 초가 걸리는 test"]
