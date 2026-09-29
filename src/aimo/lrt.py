@@ -482,10 +482,11 @@ def build_pair_tensors(
 
     encoder는 ΔU만 봅니다. decoder는 original state/update만 context로 씁니다.
     """
-    delta = macro_relation(original, variant)[None]
+    device = stats.update_scale.device
+    delta = macro_relation(original, variant)[None].to(device)
     return {
         "delta_norm": stats.norm_update(delta),
-        "original_state_norm": stats.norm_state(original.state[None]),
-        "original_update_norm": stats.norm_update(original.updates[None]),
-        "relative_positions": original.relative_positions[None],
+        "original_state_norm": stats.norm_state(original.state[None].to(device)),
+        "original_update_norm": stats.norm_update(original.updates[None].to(device)),
+        "relative_positions": original.relative_positions[None].to(device),
     }

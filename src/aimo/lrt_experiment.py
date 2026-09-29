@@ -5,8 +5,8 @@
 
 Primary metric은 **transport ratio**입니다.
 
-    E_pred = Σ_valid ||ΔU_norm - ΔU_hat_norm||²
-    E_zero = Σ_valid ||ΔU_norm||²
+    E_pred = mean_valid_scalar ||ΔU_norm - ΔU_hat_norm||²
+    E_zero = mean_valid_scalar ||ΔU_norm||²
     R      = E_pred / max(E_zero, τ)
 
 Zero predictor는 R = 1로 해석합니다. variants/folds를 해당 original 안에서 먼저 평균한 뒤
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,6 +71,15 @@ class TransportTerm:
     ratio: float
     n_cells: int
     below_floor: bool = False
+    n_scalar: int = 0
+
+    @property
+    def mse_pred(self):
+        return self.e_pred
+
+    @property
+    def mse_zero(self):
+        return self.e_zero
 
 
 def denominator(e_zero: float, floor: float) -> float:
@@ -85,9 +95,12 @@ def transport_term(
     delta_norm / delta_hat : [Q, P_sel, 2, H]
     valid                  : [P_sel] bool
     """
-    mask = valid.view(1, -1, 1, 1).to(delta_norm.dtype)
-    e_pred = float(((delta_norm - delta_hat).pow(2) * mask).sum())
-    e_zero = float((delta_norm.pow(2) * mask).sum())
+    if floor <= 0 or not bool(valid.any()):
+        raise ValueError("positive floor and nonempty valid mask required")
+    n_scalar = int(valid.sum()) * delta_norm.shape[0] * delta_norm.shape[2] * delta_norm.shape[3]
+    mask = valid.view(1, -1, 1, 1).to(device=delta_norm.device, dtype=delta_norm.dtype)
+    e_pred = float(((delta_norm - delta_hat).pow(2) * mask).sum() / n_scalar)
+    e_zero = float((delta_norm.pow(2) * mask).sum() / n_scalar)
     den = denominator(e_zero, floor)
     return TransportTerm(
         e_pred=e_pred,
@@ -95,6 +108,7 @@ def transport_term(
         ratio=e_pred / den,
         n_cells=int(valid.sum()) * delta_norm.shape[0] * delta_norm.shape[2],
         below_floor=e_zero < floor,
+        n_scalar=n_scalar,
     )
 
 
@@ -102,9 +116,12 @@ def transport_loss(
     delta_norm: Tensor, delta_hat: Tensor, valid: Tensor, floor: float
 ) -> Tensor:
     """gradient가 흐르는 transport ratio (한 fold). denominator는 상수로 둡니다."""
-    mask = valid.view(1, -1, 1, 1).to(delta_norm.dtype)
-    e_pred = ((delta_norm - delta_hat).pow(2) * mask).sum()
-    e_zero = float((delta_norm.pow(2) * mask).sum())
+    if floor <= 0 or not bool(valid.any()):
+        raise ValueError("positive floor and nonempty valid mask required")
+    n_scalar = int(valid.sum()) * delta_norm.shape[0] * delta_norm.shape[2] * delta_norm.shape[3]
+    mask = valid.view(1, -1, 1, 1).to(device=delta_norm.device, dtype=delta_norm.dtype)
+    e_pred = ((delta_norm - delta_hat).pow(2) * mask).sum() / n_scalar
+    e_zero = float((delta_norm.pow(2) * mask).sum() / n_scalar)
     return e_pred / denominator(e_zero, floor)
 
 
@@ -206,20 +223,20 @@ class Rank4LinearTransport:
     def fit(
         cls, pairs: list[tuple[MacroPage, MacroPage]], stats: MacroNormStats
     ) -> Rank4LinearTransport:
-        buckets: dict[int, list[Tensor]] = {0: [], 1: []}
+        if not pairs:
+            raise ValueError("rank4 baseline needs train pairs")
+        hidden = pairs[0][0].hidden_size
+        grams = {c: torch.zeros(hidden, hidden, dtype=torch.float64) for c in (0, 1)}
         for original, variant in pairs:
             delta = stats.norm_update(macro_relation(original, variant)[None])[0]
             valid = common_valid(original, variant)
-            for stream in (0, 1):
-                buckets[stream].append(delta[:, valid, stream].reshape(-1, delta.shape[-1]))
+            for c in (0, 1):
+                matrix = delta[:, valid, c].reshape(-1, hidden).double()
+                grams[c].addmm_(matrix.T, matrix)
         basis = {}
-        for stream, chunks in buckets.items():
-            if not chunks:
-                raise ValueError("rank4 baseline needs at least one train pair")
-            matrix = torch.cat(chunks, dim=0).double()
-            # right singular vectors가 native H-space의 rank-4 basis입니다.
-            _, _, vh = torch.linalg.svd(matrix, full_matrices=False)
-            basis[stream] = vh[: cls.rank].T.float().contiguous()  # [H, 4]
+        for c, gram in grams.items():
+            _, vectors = torch.linalg.eigh(gram)
+            basis[c] = vectors[:, -cls.rank:].float().contiguous()
         return cls(basis)
 
     def predict(self, tensors: dict, query_macros, landmarks) -> Tensor:
@@ -246,7 +263,7 @@ class Rank4LinearTransport:
 
 
 def swap_donor_index(index: int, original_ids: list[str], eval_seed: int) -> int:
-    """support-swap donor. 같은 pair 금지, 가능하면 다른 original에서 고릅니다.
+    """support-swap donor. 같은 pair / 같은 original을 금지합니다.
 
     outcome/label을 보고 고르지 않고 eval seed로 deterministic하게 정합니다.
     """
@@ -254,7 +271,9 @@ def swap_donor_index(index: int, original_ids: list[str], eval_seed: int) -> int
     if n < 2:
         raise ValueError("support-swap needs at least two pairs")
     cross = [j for j in range(n) if original_ids[j] != original_ids[index]]
-    pool = cross or [j for j in range(n) if j != index]
+    if not cross:
+        raise ValueError("support-swap requires a cross-original donor")
+    pool = cross
     digest = hashlib.sha256(f"{eval_seed}:{index}:{original_ids[index]}".encode()).hexdigest()
     return pool[int(digest, 16) % len(pool)]
 
@@ -276,7 +295,10 @@ def evaluate_transport(
         raise ValueError(f"unknown landmark_mode {landmark_mode!r}")
     if model is not None:
         model.eval()
+    device = next(model.parameters()).device if model is not None else stats.update_scale.device
+    stats = stats.to(device)
     tensors = [build_pair_tensors(o, v, stats) for o, v in pairs]
+    records = []
     original_ids = [o.original_id for o, _ in pairs]
     per_original: dict[str, list[float]] = {}
     swap_per_original: dict[str, list[float]] = {}
@@ -306,6 +328,10 @@ def evaluate_transport(
                     payload["relative_positions"],
                 ).delta_hat[0]
             term = transport_term(target, prediction, valid, floor)
+            records.append({"original_id": original.original_id, "variant_id": variant.variant_id,
+                            "fold": list(fold), "mse_pred": term.mse_pred, "mse_zero": term.mse_zero,
+                            "ratio": term.ratio, "below_floor": term.below_floor,
+                            "n_scalar": term.n_scalar, "n_cells": term.n_cells})
             per_original.setdefault(original.original_id, []).append(term.ratio)
             n_below_floor += int(term.below_floor)
             n_folds += 1
@@ -332,9 +358,12 @@ def evaluate_transport(
                     payload["relative_positions"],
                 )[0]
                 swap_term = transport_term(target, swapped, valid, floor)
+                records[-1].update(swap_ratio=swap_term.ratio, donor_original_id=original_ids[donor])
                 swap_per_original.setdefault(original.original_id, []).append(swap_term.ratio)
 
     result = {
+        "per_original": {k: sum(v)/len(v) for k, v in per_original.items()},
+        "records": records,
         "landmark_mode": landmark_mode,
         "transport_ratio": original_balanced_mean(per_original),
         "n_originals": len(per_original),
@@ -344,6 +373,7 @@ def evaluate_transport(
     }
     if support_swap and swap_per_original:
         swap_ratio = original_balanced_mean(swap_per_original)
+        result["swap_per_original"] = {k: sum(v)/len(v) for k, v in swap_per_original.items()}
         result["swap_transport_ratio"] = swap_ratio
         result["swap_gap"] = swap_ratio - result["transport_ratio"]
         result["swap_note"] = (
@@ -372,6 +402,7 @@ def train_lrt(
     batch_originals: int = 2,
     seed: int = 0,
     device: torch.device | None = None,
+    checkpoint_dir: str | Path | None = None,
 ) -> dict:
     """LRT-v1을 학습합니다. checkpoint 선택은 validation L_transport만 씁니다."""
     if not pairs:
@@ -413,7 +444,27 @@ def train_lrt(
         by_original.setdefault(original.original_id, []).append(index)
     original_ids = sorted(by_original)
 
-    for epoch in range(max_epochs):
+    start_epoch = 0
+    checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
+    last_path = checkpoint_dir / "last.pt" if checkpoint_dir else None
+    if last_path is not None and last_path.exists():
+        saved = torch.load(last_path, map_location=device, weights_only=False)
+        if saved["stats_hash"] != stats.hash() or saved["seed"] != seed or saved["floor"] != floor:
+            raise ValueError("resume metadata mismatch")
+        model.load_state_dict(saved["model"])
+        optimizer.load_state_dict(saved["optimizer"])
+        history, best, best_state = saved["history"], saved["best"], saved["best_state"]
+        patience_left = saved["patience_left"]
+        start_epoch = saved["epoch"] + 1
+        generator.set_state(saved["generator"].cpu())
+        order_generator.set_state(saved["order_generator"].cpu())
+        torch.set_rng_state(saved["rng"].cpu())
+        if device.type == "cuda":
+            torch.cuda.set_rng_state(saved["cuda_rng"].cpu(), device)
+    for epoch in range(start_epoch, max_epochs):
+        if patience_left <= 0:
+            break
+        epoch_start = time.monotonic()
         model.train()
         permutation = torch.randperm(len(original_ids), generator=order_generator).tolist()
         shuffled = [original_ids[i] for i in permutation]
@@ -467,6 +518,8 @@ def train_lrt(
                 [torch.stack(values).mean() for values in per_original.values()]
             ).mean()
             optimizer.zero_grad(set_to_none=True)
+            if not bool(torch.isfinite(total)):
+                raise ValueError("nonfinite training loss")
             total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -495,8 +548,17 @@ def train_lrt(
             patience_left = patience
         else:
             patience_left -= 1
-            if patience_left <= 0:
-                break
+        if checkpoint_dir is not None:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            atomic_save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                         "history": history, "best": best, "best_state": best_state,
+                         "patience_left": patience_left, "epoch": epoch, "seed": seed,
+                         "floor": floor, "stats_hash": stats.hash(),
+                         "generator": generator.get_state(), "order_generator": order_generator.get_state(),
+                         "rng": torch.get_rng_state(),
+                         "cuda_rng": torch.cuda.get_rng_state(device) if device.type == "cuda" else None}, last_path)
+            atomic_write_json(checkpoint_dir / "progress.json", {**record, "epoch_seconds": time.monotonic()-epoch_start})
+            print(f"seed={seed} epoch={epoch} dev_R={validation['transport_ratio']:.6f}", flush=True)
     if best_state is not None:
         model.load_state_dict(best_state)
     return {
@@ -507,7 +569,7 @@ def train_lrt(
         "epochs_run": len(history),
         "params": model.param_report().as_dict(),
         "stats_hash": stats.hash(),
-        "status": STATUS_CPU_VALIDATED,
+        "status": "REAL_CUDA_TRAINED" if device.type == "cuda" else STATUS_CPU_VALIDATED,
     }
 
 
@@ -546,7 +608,7 @@ def save_lrt_checkpoint(path: str | Path, result: dict, lrt_cfg, stats: MacroNor
 
 def load_lrt_checkpoint(path: str | Path) -> tuple[LRTModel, MacroNormStats, dict]:
     """LRT checkpoint를 읽습니다. 다른 schema는 거부합니다."""
-    payload = torch.load(Path(path), map_location="cpu")
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
     version = payload.get("schema_version")
     if version != LRT_CHECKPOINT_SCHEMA:
         raise ValueError(
@@ -759,7 +821,7 @@ def audit_macro_page(
     이 audit은 MacroPage가 U4 signal을 유지한다고 synthetic으로 증명하는 용도가 아니라,
     실제 server Fine Page에서 다음 단계가 평가할 수 있게 만드는 interface입니다.
     """
-    from .macro_page import path_energy as fine_path_energy
+    from .macro_page import relation_path_energy
 
     rows = []
     source_blocks = {page.n_blocks for pair in fine_pairs for page in pair}
@@ -780,7 +842,8 @@ def audit_macro_page(
         macro_energy = relation_energy(macro_delta, valid)
         boundaries = list(macro_o.boundaries)
         # cancellation diagnostic: macro sum norm 대비 fine path energy.
-        pe = fine_path_energy(variant, boundaries) - fine_path_energy(original, boundaries)
+        pe = relation_path_energy(original, variant, boundaries)
+        cancellation = macro_delta.norm(dim=-1) / pe.clamp_min(1e-12)
         rows.append(
             {
                 "original_id": original.original_id,
@@ -794,7 +857,10 @@ def audit_macro_page(
                 "macro_over_fine_energy": (
                     macro_energy / fine_energy if fine_energy > 0 else float("nan")
                 ),
-                "path_energy_delta_abs_mean": float(pe.abs().mean()),
+                "fine_residual_identity_error": max(original.residual_identity_error(), variant.residual_identity_error()),
+                "relation_path_energy_mean": float(pe[:, valid].mean()),
+                "cancellation_values": cancellation[:, valid].tolist(),
+                "final_token_available": bool(valid[-1]),
                 "n_common_valid": int(valid.sum()),
             }
         )
@@ -942,6 +1008,9 @@ def command(args) -> int:
 
     root = Path(args.run_dir)
     root.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "source", None) or getattr(args, "execute_gpu", False):
+        from .lrt_real import command as real_command
+        return real_command(args)
     cfg = load_config(args.config) if getattr(args, "config", None) else None
     lrt_cfg = cfg.lrt if cfg is not None else None
     if lrt_cfg is None:

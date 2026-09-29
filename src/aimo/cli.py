@@ -1292,6 +1292,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_lrt = sub.add_parser("lrt-experiment", help="LRT-v1 cross-macro relational transport")
     p_lrt.add_argument("--run-dir", required=True)
     p_lrt.add_argument("--config", default=None)
+    p_lrt.add_argument("--source", default=None)
+    p_lrt.add_argument("--execute-gpu", action="store_true")
     p_lrt.add_argument("--toy", choices=["A", "B"], default=None, help="CPU toy fixture 실행")
     p_lrt.add_argument("--toy-floor", type=float, default=None, help="toy용 explicit τ")
     p_lrt.add_argument("--max-epochs", type=int, default=200)

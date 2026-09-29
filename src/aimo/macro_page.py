@@ -207,3 +207,10 @@ def relation_energy(delta: Tensor, valid: Tensor) -> float:
     """valid landmark에서의 relation energy sum ||ΔU||². Fine/Macro 비교 diagnostic용."""
     mask = valid.view(1, -1, 1, 1).expand_as(delta)
     return float((delta.pow(2) * mask).sum())
+
+
+def relation_path_energy(original: Page, variant: Page, boundaries: list[int]) -> Tensor:
+    """Fine pair relation의 path length [G,P,2]; diagnostic 전용."""
+    delta = variant.updates - original.updates
+    return torch.stack([delta[a:b].norm(dim=-1).sum(dim=0)
+                        for a, b in zip(boundaries[:-1], boundaries[1:], strict=True)])
