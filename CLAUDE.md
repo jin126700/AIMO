@@ -15,6 +15,10 @@
 
 짧게 기억할 것:
 
+- 새 candidate backend는 **Stage-E native representation** (`stage_e_v1`, AGENTS.md 첫 section)이며
+  `IMPLEMENTED / CPU-TOY-TESTED / REAL-MODEL-UNVERIFIED`입니다. legacy Looped / LRT 경로와
+  분리되어 있고 아래 legacy 규칙은 legacy 경로에 그대로 적용됩니다.
+
 - 현재 primary는 **behavior supervision + flow auxiliary joint** 학습입니다
   (`L = L_behavior + 0.1 * L_flow`). stable-only flow-only는 legacy baseline입니다.
 - Behavior와 Flow는 같은 `LoopedCore` 객체를 공유합니다. Transformer를 두 개 만들지 않습니다.

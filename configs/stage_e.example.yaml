@@ -1,0 +1,29 @@
+# Stage-E native representation backend 예시.
+# 서버에서 복사해 configs/stage_e.yaml로 쓰고 revision / 경로를 실제 값으로 채운다.
+# revision이 null이면 native-extract / stage-e discovery / submission-features가 멈춘다.
+stage_e:
+  backend: stage_e_v1
+  model_id: Qwen/Qwen3.5-4B
+  model_revision: null        # 실제 HF commit hash로 pin
+  tokenizer_revision: null    # 실제 HF commit hash로 pin
+  dtype: bfloat16
+  trust_remote_code: false
+  n_macro: 8                  # Qwen3.5-4B 32 layers -> 4개씩 8 macro
+  rank: 16
+  rank_grid: [4, 8, 16, 32]
+  lambda_grid: [0.0, 0.1, 1.0]
+  npr_topk: 32
+  n_probes: 4
+  sketch_q: 64
+  sketch_seed: 20260930
+  audit_sketch_seed: 20260931
+  vocab_chunk: 8192
+  max_tokens: 4096
+  max_mp_views: 2
+  selection_kl_tolerance: 0.05
+  discovery_data: null        # 로컬 DeepMath subset JSONL / parquet
+  gsm8k_data: null            # GSM8K main/train
+  protected_registry: null    # locked / known-test / evaluation-only IDs and texts
+  official_labels: null       # train-main-v2
+  time_limit_seconds: 3600
+  internal_target_seconds: 2700

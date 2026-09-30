@@ -241,3 +241,22 @@ numerical_backend, scorer_id, scorer_version
    `synthetic_toy_panel_max_drop_below_threshold`로 frozen 처리합니다.
 
 label·ID·namespace를 predictive feature로 직접 넣지 않습니다.
+
+## Stage-E discovery 데이터 규칙 (`native_data.py`)
+
+- discovery 주 데이터는 새 DeepMath subset이다. model 입력은 `question`뿐이고
+  `topic` / `difficulty`는 split·분석 metadata다. `final_answer`, `r1_solution_*`는 읽는 즉시
+  버린다.
+- GSM8K main/train은 feasibility와 쉬운 계산 대조군이다. `answer`(풀이 포함)는 버린다.
+- GSM-Symbolic / GSM-Plus는 discovery fitting에 섞지 않는다 (loader가 거부한다).
+- locked / known-test / evaluation-only ID와 정규화 text hash는 `ProtectedRegistry`로 막는다.
+  공식 `cases.jsonl`도 그대로 protected source로 읽을 수 있다.
+- split은 root 단위 deterministic hash다. 같은 original / root / template의 모든 variant와
+  model / effort 행은 같은 split이다 (`validate_lineage`).
+- numeric variant, P1/P2, 외부 paraphrase는 MP가 아니다. 검증된 formatting view만 MP다.
+- 공식 train-main-v2 label은 Stage-E 공간과 feature를 freeze한 뒤 작은 predictor에만 쓴다.
+  null label은 채우지 않고 제외하며 수를 보고한다. root lineage는 (dataset_id, problem_id)와
+  정규화 text hash의 union으로 실제 source에서 계산한다. label 수를 hardcode하지 않는다.
+- native prefix는 target model이 직접 생성한 짧은 text만 허용한다 (dataset solution 금지).
+- 로컬에는 DeepMath / GSM8K / 공식 label 파일이 없다. 실제 데이터 학습은
+  `DATA_UNAVAILABLE`로 남아 있다.

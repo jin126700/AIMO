@@ -1,3 +1,14 @@
+## Current candidate backend: Stage-E native representation
+
+`stage_e_v1`은 target model의 native next-token distribution을 label 없이 teacher로 써서
+macro stage별 저차원 좌표(`z = L_g B_gᵀ s + a_g`)를 찾고, 그 좌표로 공식 `are_robust`
+predictor를 만드는 새 backend다. 상태는 `IMPLEMENTED / CPU-TOY-TESTED /
+REAL-MODEL-UNVERIFIED`이며 실제 model, GPU, 공식 runtime 검증은 아직 없다. legacy Looped /
+E-FLOW-1 / LRT-v1 경로는 그대로 남아 있다. 설계는
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), server gate는
+[docs/EXPERIMENTS.md](docs/EXPERIMENTS.md), 실행 명령은
+[docs/SERVER_HANDOFF.md](docs/SERVER_HANDOFF.md)에 있다.
+
 ## Current primary: Flow representation learning → frozen robustness probe
 
 현재 primary는 **E-FLOW-1**이다. 직전 FP32 behavior regression의 전체 81 valid pairs 중

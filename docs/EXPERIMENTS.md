@@ -1,3 +1,58 @@
+## Next server gates: Stage-E native representation (`stage_e_v1`)
+
+로컬에서는 코드와 CPU toy 검증만 끝났다. 아래 gate는 서버에서 순서대로 실행하고, 앞 gate가
+실패하면 뒤 gate를 돌리지 않는다. 판정 기준은 결과를 보기 전에 여기 고정한다.
+
+### Gate N0 — extractor audit (Qwen3.5-4B, 실제 weights)
+
+- `aimo native-extract --execute-gpu`로 소수 문제 audit page를 만든다.
+- 기록: macro residual identity, Mixer 종류별(`linear_attention`, `full_attention`) module
+  disagreement, final norm hidden ≠ raw final boundary, batch(padding) vs single 일치,
+  bf16 forward의 identity 오차.
+- 실패하면 layout adapter를 고치기 전까지 학습하지 않는다.
+
+### Gate N1 — sketch folding과 backward 지원
+
+- `sketch.verify_folding`으로 `Rᵀlog_softmax(l)`와 folded head 비교, `column_sum_error`.
+- hybrid Mixer backward가 되는지, `directional_fd_check`로 VJP와 중앙 차분 비교,
+  inference backend와 gradient backend의 forward 출력 차이.
+
+### Gate N2 — discovery (DeepMath subset, GSM8K feasibility)
+
+- `aimo stage-e --stage discovery --dataset deepmath --execute-gpu`: rank {4,8,16,32} ×
+  λ grid를 discovery Dev에서만 고른다 (`select_on_dev` 규칙, tolerance 0.05).
+- GSM8K main/train은 `--dataset gsm8k`로 같은 경로의 feasibility 대조군이다.
+- `protected_registry`(locked / known-test / evaluation-only ID와 text)가 없으면 실행하지
+  않는다. GSM-Symbolic / GSM-Plus는 fitting에 넣지 않는다.
+
+### Gate N3 — held-out A/B/C (주장 기준을 미리 고정)
+
+- A (native fidelity / gradient capture): 같은 rank에서 Stage-E의 held-out gradient capture가
+  `output_compression_reduced_rank`와 `pca_r_trained_decoder`보다 높고, coarse KL이 그 둘보다
+  5% 넘게 나쁘지 않을 때만 "출력 압축을 넘는 capture"라고 쓴다.
+- 제출 residual feature 사용 여부는 held-out이 아니라 **discovery Dev**의
+  `sketch_relative_error`로 Gate N2에서 정한다 (1 이상이면 쓰지 않는다). held-out 결과로
+  feature를 다시 고르지 않는다.
+- B (generalization): held-out topic / difficulty / MP family에서 A와 같은 비교를 반복한다.
+- C (causal use): projected recovery가 random subspace, complement, norm-matched,
+  rank-matched PCA, site-matched control보다 높을 때만 "projected intervention이 natural donor
+  effect를 회복"이라고 쓴다. 단일 stage patch 결과이며 mechanism 주장이 아니다.
+- 결과가 기준에 못 미치면 rank / feature를 다시 고르지 않고 negative로 기록한다.
+
+### Gate N4 — 공식 predictor와 1시간 runtime
+
+- `submission-features`(공식 train-main-v2, null label 제외) → `submission-fit`
+  (root-grouped CV) → `submission-artifact` → `submission-bundle`.
+- 공식 `Dockerfile.competition` runtime(PyTorch 2.12.1 / Transformers 5.13.0)에서 4개 model
+  전체 workload로 1시간 benchmark: 실측 총 시간, model별 fallback 사용률, fallback 포함
+  accuracy와 non-fallback accuracy를 따로 기록한다.
+- 목표 내부 시간은 2700초다. 넘으면 CostModel prior를 서버 실측으로 갱신한다.
+
+### 이번에 하지 않은 것
+
+GPU 학습, 대규모 model 다운로드, native generation(prefix 생성), locked held-out 평가, 실제
+대회 제출. 코드는 준비되어 있지만 실행하지 않았다.
+
 ## Current primary: Flow representation learning → frozen robustness probe
 
 현재 primary는 **E-FLOW-1**이다. 직전 FP32 behavior regression의 전체 81 valid pairs 중

@@ -1,3 +1,55 @@
+## Current candidate backend: Stage-E native representation (`stage_e_v1`)
+
+상태: `IMPLEMENTED / CPU-TOY-TESTED / REAL-MODEL-UNVERIFIED`. 실제 model·GPU·runtime 검증 없이
+validated, successful, submission-ready라고 쓰지 않는다. 상세는
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 첫 section, server gate는
+[docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) 첫 section에 있다.
+
+새 backend는 legacy(Looped Behavior/Flow, E-FLOW-1, LRT-v1)와 분리되어 있다. legacy 명령,
+Page schema, checkpoint는 비교용으로 그대로 유지한다. 새 경로는 `aimo native-extract`,
+`aimo stage-e`, `aimo submission-*`, config `stage_e` section으로만 선택한다.
+
+### 절대 깨면 안 되는 것 (Stage-E)
+
+- native 경로는 실제 raw `H`, **모든 token**, 실제 macro boundary, Mixer/FFN actual residual
+  update를 요구한다. 기존 sparse Page(17 landmark, projection 좌표)를 자동 변환하지 않는다
+  (`SCHEMA_INCOMPATIBLE` / `DATA_LIMIT`). landmark sampling, pooling, 무단 truncation 금지.
+- actual update는 residual 차이(`h_mid - h_in`, `h_out - h_mid`)다. attention output hook을
+  update로 그대로 쓰지 않는다. module hook은 일치 audit에만 쓴다.
+- raw final boundary와 final norm 이후 hidden은 따로 관측한다.
+- Stage-E: `B_g` orthonormal, `L_g` invertible, `E_g = L_g B_gᵀ`, 공유 linear decoder
+  `D z + b`. projector는 `B_g B_gᵀ`, lift는 `E_g⁺ = B_g L_g⁻¹`. 문제별 refit / test-time
+  adaptation 금지. decoder에 원문·token ID·attention network 금지.
+- discovery는 label-free다. teacher는 native next-token distribution. behavior label,
+  correctness, robustness, max_drop, `final_answer`, `r1_solution_*`, dataset solution을 입력·
+  teacher·loss에 넣지 않는다 (`native_data.assert_label_free`).
+- NPR loss는 top-k + 실제 OTHER 질량의 coarse KL이다. top-k 재정규화 KL을 full KL이라고
+  부르지 않는다. token은 문제별로 정규화한다.
+- sensitivity는 offline 연구 경로 전용(VJP, detach, second-order 없음)이다. 제출 entry point는
+  `sensitivity` / `stage_e_experiment` / `npr` / `native_data`를 import하지 않는다.
+- rank와 λ는 discovery Dev에서만 고른다. held-out이나 official score를 보고 rank / feature /
+  sketch / normalization을 다시 맞추지 않는다.
+- locked / known-test / evaluation-only ID와 text는 discovery에 들어갈 수 없다. GSM-Symbolic /
+  GSM-Plus를 fitting에 섞지 않는다. numeric variant나 P1/P2를 MP로 자동 분류하지 않는다.
+  같은 root의 모든 variant / model / effort 행은 같은 split이다.
+- 공식 label의 null은 채우지 않는다. label 수를 hardcode하지 않고 실제 source에서 센다.
+- 제출: `are_robust(model_id, reasoning_effort, problems) -> list[bool]`, 실제 Python bool,
+  순서·길이 보존. 3600초는 모든 model·문제 합계이고 내부 목표는 2700초. fallback은 prior이며
+  shared encoder 검증으로 보고하지 않는다. `trust_remote_code=False`, 다운로드 / 외부 API 없음,
+  artifact에 pickle 없음, model revision pin 필수.
+
+### 로컬 실행 (CPU)
+
+```sh
+.venv/bin/python -m aimo stage-e --run-dir runs/stage_e_toy --stage toy --n-macro 4
+.venv/bin/python -m aimo native-extract --run-dir runs/native_toy --toy --n-macro 4
+.venv/bin/python -m aimo stage-e --run-dir runs/stage_e_spec --stage spec
+.venv/bin/python -m aimo official-contract
+```
+
+로컬에는 Docker와 Qwen3.5-4B weights가 없고, 로컬 transformers(4.39)는 Qwen3.5를 읽지 못한다.
+toy model 결과는 hook 논리 검증일 뿐 연구 성능이 아니다.
+
 ## Current primary candidate: LRT-v1 (Looped Relational Transport)
 
 현재 primary candidate는 **LRT-v1**이며 상태는

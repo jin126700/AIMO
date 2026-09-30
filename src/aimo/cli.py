@@ -1302,6 +1302,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_lrt.set_defaults(func=lrt_command)
 
+    from .stage_e_cli import register as register_stage_e
+
+    register_stage_e(sub)
+
     p_flow = sub.add_parser("flow-representation-experiment", help="E-FLOW-1 label-free Flow + frozen probe")
     p_flow.add_argument("--run-dir", required=True)
     p_flow.add_argument("--source", default=None)

@@ -372,6 +372,62 @@ class LRTConfig:
 
 
 @dataclass
+class StageEConfig:
+    """Stage-E native representation backend 설정 (`aimo stage-e`, `aimo native-extract`).
+
+    rank와 lambda는 discovery Dev에서만 고릅니다. revision이 null이면 실제 실험 artifact를
+    만들 수 없습니다 (pin 필요). trust_remote_code는 허용하지 않습니다.
+    """
+
+    backend: str = "stage_e_v1"
+    model_id: str = "Qwen/Qwen3.5-4B"
+    model_revision: str | None = None
+    tokenizer_revision: str | None = None
+    dtype: str = "bfloat16"
+    trust_remote_code: bool = False
+    n_macro: int = 8
+    rank: int = 16
+    rank_grid: tuple[int, ...] = (4, 8, 16, 32)
+    sensitivity_lambda: float = 0.0
+    lambda_grid: tuple[float, ...] = (0.0, 0.1, 1.0)
+    npr_topk: int = 32
+    n_probes: int = 4
+    probe_seed: int = 0
+    sensitivity_eps: float = 1e-8
+    sketch_q: int = 64
+    sketch_seed: int = 20260930
+    audit_sketch_seed: int = 20260931
+    vocab_chunk: int = 8192
+    max_tokens: int = 4096
+    max_mp_views: int = 2
+    selection_kl_tolerance: float = 0.05
+    discovery_data: str | None = None
+    gsm8k_data: str | None = None
+    protected_registry: str | None = None
+    official_labels: str | None = None
+    time_limit_seconds: float = 3600.0
+    internal_target_seconds: float = 2700.0
+
+    def __post_init__(self) -> None:
+        if self.backend != "stage_e_v1":
+            raise ValueError(f"stage_e.backend must be 'stage_e_v1', got {self.backend!r}")
+        if self.trust_remote_code:
+            raise ValueError("stage_e.trust_remote_code must stay false")
+        if self.npr_topk < 1 or self.sketch_q < 1 or self.n_probes < 1:
+            raise ValueError("stage_e.npr_topk, sketch_q and n_probes must be positive")
+        if any(r < 1 for r in self.rank_grid) or self.rank not in self.rank_grid:
+            raise ValueError("stage_e.rank must be one of stage_e.rank_grid")
+        if any(lam < 0 for lam in self.lambda_grid) or 0.0 not in self.lambda_grid:
+            raise ValueError("stage_e.lambda_grid must be non-negative and include the 0 baseline")
+        if self.sketch_seed == self.audit_sketch_seed:
+            raise ValueError("the audit sketch R' must use an independent seed")
+        if not 1 <= self.max_mp_views <= 2:
+            raise ValueError("stage_e.max_mp_views must be 1 or 2")
+        if not 0 < self.internal_target_seconds <= self.time_limit_seconds <= 3600.0:
+            raise ValueError("need 0 < internal_target_seconds <= time_limit_seconds <= 3600")
+
+
+@dataclass
 class Config:
     run: RunConfig = field(default_factory=RunConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
@@ -381,6 +437,7 @@ class Config:
     eval: EvalConfig = field(default_factory=EvalConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     lrt: LRTConfig = field(default_factory=LRTConfig)
+    stage_e: StageEConfig = field(default_factory=StageEConfig)
 
     @property
     def run_dir(self) -> Path:
@@ -390,7 +447,12 @@ class Config:
         return asdict(self)
 
     def hash(self) -> str:
-        blob = json.dumps(self.to_dict(), sort_keys=True, default=str).encode()
+        payload = self.to_dict()
+        # stage_e section이 기본값이면 hash에서 뺍니다. 이 section이 생기기 전의 Looped / LRT /
+        # FP32 run이 기록한 config hash(resume guard)를 그대로 보존하기 위해서입니다.
+        if self.stage_e == StageEConfig():
+            payload.pop("stage_e")
+        blob = json.dumps(payload, sort_keys=True, default=str).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
 
 

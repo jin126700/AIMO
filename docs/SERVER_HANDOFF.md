@@ -198,3 +198,37 @@ transformers 조건까지 함께 봅니다 (`gpu_blockers`로 이유를 나열�
 - `aimo deepmath-real --stage finish --run-dir <existing-root>`는 실제 calibration 비용상 최소 학습 cohort조차 불가능할 때 DATA/PROTOCOL_LIMIT을 기록합니다. 가능할 때는 거짓 종료하지 않고 오류를 냅니다.
 - 이 patch는 본실험 학습 완료를 의미하지 않습니다. 실행 결과는 repository root의 Loop_result.md와 해당 result manifest가 근거입니다.
 - CPU 회귀 및 실제 CUDA 진단은 result/protocol에 보존합니다. PyTorch 2.7에서 NumPy RNG는 기본 자료형으로 checkpoint에 저장합니다.
+
+## Stage-E backend 실행 순서 (server, 미실행)
+
+아래 명령은 준비만 되어 있고 이번 작업에서 실행하지 않았다. `configs/stage_e.example.yaml`을
+복사해 `stage_e.model_revision`, `stage_e.tokenizer_revision`(실제 HF commit hash),
+데이터 경로, `protected_registry`를 채운다. revision이 비어 있으면 모든 실제 단계가 멈춘다.
+
+```sh
+# 0) 계약과 spec (weights 없음)
+python -m aimo official-contract
+python -m aimo stage-e --run-dir runs/stage_e_spec --stage spec --config configs/stage_e.yaml
+# Gate N0) 실제 extractor audit (소수 문제)
+python -m aimo native-extract --run-dir runs/native_audit --config configs/stage_e.yaml \
+  --dataset deepmath --limit 8 --execute-gpu
+# Gate N2/N3) discovery grid (Dev 선택) -> 대조군 -> held-out A/B/C
+python -m aimo stage-e --run-dir runs/stage_e_deepmath --stage discovery \
+  --config configs/stage_e.yaml --dataset deepmath --execute-gpu
+python -m aimo stage-e --run-dir runs/stage_e_gsm8k --stage discovery \
+  --config configs/stage_e.yaml --dataset gsm8k --execute-gpu
+# Gate N4) 공식 predictor, artifact, bundle
+python -m aimo submission-features --stage-e runs/stage_e_deepmath/stage_e \
+  --labels /path/to/train-main-v2.jsonl --out runs/features.jsonl \
+  --config configs/stage_e.yaml --execute-gpu
+python -m aimo submission-fit --features runs/features.jsonl --out runs/fit
+python -m aimo submission-artifact --stage-e runs/stage_e_deepmath/stage_e --fit runs/fit \
+  --out runs/artifact --config configs/stage_e.yaml --cost runs/cost_model.json
+python -m aimo submission-bundle --out runs/bundle_small --artifact runs/artifact --zip
+python -m aimo submission-local --cases data/val-sample/input/cases.jsonl \
+  --labels data/val-sample/reference/labels.jsonl --artifact runs/artifact
+```
+
+1시간 benchmark는 공식 `Dockerfile.competition`(starter commit
+`de794053debe75a711400696e66b60937cebbb1b`) runtime에서 bundle을 공식 ingestion으로 돌려 잰다.
+결과, cache, artifact, checkpoint는 Git에 넣지 않는다.

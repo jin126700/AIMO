@@ -1,3 +1,157 @@
+## Current candidate backend: Stage-E native representation (`stage_e_v1`)
+
+상태: `IMPLEMENTED / CPU-TOY-TESTED / REAL-MODEL-UNVERIFIED`. 실제 Qwen3.5-4B hook, backward,
+수치 허용치, GPU VRAM, 1시간 benchmark는 아직 실행하지 않았다. 코드 구현이 끝난 것과 연구
+검증·대회 제출 준비가 끝난 것은 다르다.
+
+새 backend는 legacy 경로와 **분리**되어 있다. LoopedCore / Behavior / E-FLOW-1 / LRT-v1과 그
+checkpoint는 비교용으로 그대로 남고, 새 경로는 `aimo native-extract`, `aimo stage-e`,
+`aimo submission-*` 명령과 config의 `stage_e` section으로만 선택한다. 공통 좌표를 검증하는
+경로에 비선형 reasoning network(LoopedCore)를 넣지 않는다.
+
+### 관측: macro × all-token NativePage (`native_page.py`, `native_extract.py`)
+
+- schema `aimo-native-page-v1`. 실제 raw `H`, prompt의 **모든 token**, macro boundary의 raw
+  state `S_{b_g}` [G+1, T, H], macro별 `M_g`, `F_g` [G, T, H], final norm 이후 hidden [T, H],
+  token span map(segment + 문제 text 기준 char offset)을 담는다.
+- 기존 17-landmark Page는 자동 변환하지 않는다 (`SCHEMA_INCOMPATIBLE`). projection 좌표나
+  17 landmark를 native `H`나 all-token으로 취급하지 않는다.
+- actual update는 residual 차이로 정의한다: `M_l = h_mid - h_in`, `F_l = h_out - h_mid`.
+  `h_mid`는 layout이 정한 module의 입력에서 읽는다 (`model_registry.py`).
+  - `pre_norm` (Qwen2/Qwen3/Qwen3.5 hybrid): `post_attention_layernorm` 입력.
+    linear-attention(`linear_attn`)과 full-attention(`self_attn`) Mixer를 모두 같은 방식으로
+    처리한다.
+  - `post_norm` (OLMo-2/3 계열): `mlp` 입력. update는 norm이 적용된 sublayer 출력이다.
+  - Mixer/FFN module의 hook 출력은 actual update와의 **일치 audit**에만 쓴다. residual 차이로
+    정의한 identity `S_{b_{g+1}} - S_{b_g} ≈ M_g + F_g`는 구조상 거의 자명하므로, 비자명한
+    검사는 module disagreement다 (module 밖 gate가 있으면 검출된다).
+- raw final boundary는 마지막 layer 출력 hook, final norm 이후 hidden은 backbone `norm` 출력
+  hook에서 따로 읽는다. `output_hidden_states[-1]`을 raw boundary로 가정하지 않는다.
+- landmark sampling, projection 전 pooling, 무단 truncation이 없다. 길이가 넘치면
+  `DATA_LIMIT`. 가변 T는 오른쪽 padding + `attention_mask`로 처리한다.
+- `AuditSink`는 offline audit용 완전 관측, `StreamSink`는 제출용으로 update가 생길 때마다
+  `E_g`로 투영해 누적하고 raw Page를 보관하지 않는다 (두 경로의 latent 일치를 test로 고정).
+- Qwen3.5-4B: 32 layers → `b_g = floor(g·32/8)` = 4개씩 8 macro. 다른 model은 실제
+  `num_hidden_layers`를 읽는다 (예: 28층이면 [0,3,7,10,14,17,21,24,28]).
+- 알 수 없는 `model_type`은 추측하지 않고 `SCHEMA_INCOMPATIBLE`. `trust_remote_code=False`.
+
+### Stage-E representation (`stage_e.py`)
+
+```
+B_g ∈ R^[H×r], B_gᵀB_g = I            (QR, 부호 고정)
+L_g ∈ R^[r×r]                          (lower-triangular, 대각 exp → 항상 invertible)
+E_g = L_g B_gᵀ
+z_state[g,t] = E_g s_out[g,t] + a_g     z_mixer = E_g M_g,  z_ffn = E_g F_g
+predicted_logits[g,t] = D z_state[g,t] + b      (모든 stage 공유 linear decoder)
+```
+
+- 같은 `E_g`, `a_g`를 macro 입구/출구에 쓰면 `z_out - z_in = z_mixer + z_ffn`. 서로 다른
+  stage encoder의 latent 차이는 이 식과 다르다.
+- projector는 `B_g B_gᵀ`. 일반 `E_g`에 대해 `E_gᵀE_g`를 projector로 쓰지 않는다.
+  native lift는 `E_g⁺ = B_g L_g⁻¹` (`E_g E_g⁺ = I`, `E_g⁺ E_g = B_g B_gᵀ`).
+- `L_g`는 gauge다. z는 바뀌지만 projector와 lift된 native 변화는 바뀌지 않는다.
+- decoder에는 원문, token ID, attention network가 들어가지 않는다.
+- encoder는 stage별로 다르고 모든 문제에 같은 frozen encoder를 쓴다. refitting / test-time
+  adaptation 없음.
+- 초기 rank grid `4, 8, 16, 32`. rank와 lambda는 discovery Dev에서만 고른다.
+- parameter 수: `G·H·r + G·r² + G·r + V·r + V` (`StageE.parameter_report`).
+- Factorized Joint는 Stage-E freeze 뒤의 보조 분석으로만 둔다. raw depth×hidden
+  factorization을 primary에 강제하지 않는다.
+
+### Teacher와 loss (`npr.py`, `sensitivity.py`)
+
+```
+L = L_NPR + λ · L_sensitivity
+```
+
+- teacher는 target model의 실제 native next-token distribution이다. behavior label,
+  correctness, robustness, max_drop, raw update reconstruction은 discovery loss에 없다.
+- `L_NPR`: teacher top-k(k=32) + OTHER의 **coarse categorical KL**. OTHER는 나머지
+  vocabulary의 실제 질량이며 top-k를 재정규화하지 않는다. full KL이라고 부르지 않는다.
+  teacher/student normalizer는 vocabulary chunk로 계산하고 student 쪽은 chunk마다 gradient
+  checkpoint를 써서 T×V activation을 저장하지 않는다. `full_vocab_kl`은 audit 경로다.
+- valid-token mask와 문제별 정규화: 문제 안에서 token/stage 평균 후 문제끼리 평균한다.
+- `L_sensitivity`: 고정 seed probe `v_j`에 대한 `a_gj = ∂(v_jᵀy)/∂S_g`의 비포착 비율
+  `Σ||a - aBBᵀ||² / max(Σ||a||², ε)`. VJP 한 번과 r차원 projection으로 계산하고
+  (`||a||² - ||aB||²`), `a`는 detach, `create_graph=False`. target weight는 학습하지 않는다.
+  λ=0 baseline을 항상 grid에 둔다. 제출 entry point는 이 module을 import하지 않는다.
+- 입력: prompt-only가 기본이고 target model이 생성한 짧은 native prefix를 지원한다. dataset
+  제공 solution은 prefix로 쓰지 않는다. 숫자·부호·연산자·조건 contrast probe와 style/format
+  control은 continuation audit용이며 정답 annotation이나 수학 relation label이 아니다.
+
+### Response sketch (`sketch.py`)
+
+```
+R ∈ R^[V×q] (q=64, 고정 seed), Rᵀ1 = 0
+y     = Rᵀ log_softmax(l) = Rᵀ l = (RᵀW_lm) N(h_final) + Rᵀ b_lm
+y_hat = (RᵀD) z_state + Rᵀ b
+```
+
+- 이름은 **logit-contrast sketch**이며 full NPR가 아니다. folded head는 cached target
+  model에서 process 안에서 한 번 만들고 재사용한다. logit softcap 같은 비선형 head는 거부한다.
+- 압축 사각지대 audit: 독립 sketch `R'`, full-vocabulary KL, contrast-probe continuation KL.
+- CPU toy 관찰(연구 성능 아님): coarse KL이 작아도 sketch 상대 오차가 1을 넘을 수 있었다.
+  coarse KL은 OTHER 안의 tail logit을 제약하지 않기 때문이다. server에서는 discovery Dev의
+  `sketch_relative_error`를 residual feature 사용 전에 먼저 본다 (held-out으로 고르지 않는다).
+
+### 제출 predictor (`submission.py`, `mp_views.py`, `robust_predictor.py`)
+
+- 기본 feature 3개: Original–MP prompt-end native divergence(full-vocab JS), all-token
+  unexplained response-change residual의 max, 같은 residual의 RMS.
+  residual = `||Δy - (RᵀD)Δz_g|| / √q` (대응 endpoint 쌍, 모든 stage). raw latent norm은
+  instability로 쓰지 않는다. 길이·confidence·alignment coverage는 control feature다.
+- MP view는 수식 span 밖 whitespace만 바꾸는 2개(`whitespace_collapse`, `line_reflow`).
+  비공백 문자열(semantic signature)이 원문과 같지 않으면 버린다. LLM paraphrase나 긴
+  generation은 기본 경로에 없다.
+- token index 차이를 쓰지 않는다. edit map과 tokenizer offset으로 **같은 semantic prefix에서
+  끝나는 complete-span endpoint**만 대응시키고 coverage와 실패 이유를 기록한다. prompt-end
+  anchor는 template suffix token이 같을 때만 쓴다.
+- predictor는 작은 L2 logistic이며 JSON artifact(pickle 없음)다. transform, 정규화 강도,
+  threshold는 root-grouped CV에서만 고른다. official score로 encoder/rank/feature를 다시
+  맞추지 않는다.
+- `are_robust(model_id, reasoning_effort, problems) -> list[bool]`: 순서·길이 보존, 실제
+  Python bool. registry는 공식 Small Models Track 4개 ID를 그대로 쓰고 adapter/artifact 상태를
+  구분한다. `openai/gpt-oss-120b`는 main-only이고 adapter가 없다.
+- 시간: 모든 model·문제 합계 3600초, 내부 목표 2700초. import 시점 monotonic clock을 여러
+  호출에 걸쳐 공유한다. model load 전과 문제별 forward 전에 비용을 예측하고, 부족하면
+  검증된 prior fallback을 쓴다. fallback 사용률과 fallback 포함 accuracy를 따로 보고한다.
+  artifact가 없는 model에 fallback한 것을 shared encoder 검증으로 보고하지 않는다.
+- frozen forward만 한다: gradient, intervention, fitting, 다운로드, 외부 API 없음.
+  같은 model의 effort 호출에서는 load한 model을 재사용한다. artifact의 model revision과
+  실제 load된 `_commit_hash`가 다르면 fallback한다.
+
+### 연구 대조군과 평가 (`stage_e_experiment.py`)
+
+| 대조군 | 의미 |
+| --- | --- |
+| `random_r_trained_decoder` | 고정 random orthonormal B + 학습 decoder |
+| `pca_r_trained_decoder` | train split PCA B + 학습 decoder |
+| `npr_only_lambda0` | λ=0 |
+| `full_hidden_readout` | B=I (rank H) readout, gradient capture 상한 1 |
+| `output_compression_reduced_rank` | native head(RᵀW)의 top-r 방향, 출력 압축 기준 |
+| `local_fit_oracle_support_query` | 문제별 support token으로 fit, query token에서 평가 (test-time fit 참고값) |
+
+- A: held-out coarse KL, full-vocab KL audit, sketch / 독립 sketch 오차, gradient capture.
+- B: topic / difficulty로 root 전체를 떼어낸 group, MP formatting view family.
+- C: natural donor(다른 root)의 prompt-end state를 한 macro boundary에 넣은 full patch 효과를
+  `E⁺(z_d - z_r) = BBᵀΔs` patch가 회복하는 정도. control: random subspace, complement,
+  norm-matched random, rank-matched PCA, site-matched random donor. stage 하나만 patch하며
+  여러 stage clamp를 자연적 causal mechanism으로 단정하지 않는다.
+- native fidelity, causal use, 공식 robustness 예측 성능은 따로 보고한다. 실패한 held-out을
+  보고 rank/feature를 다시 고르는 자동 반복은 없다 (`select_on_dev`는 Dev 결과만 받는다).
+
+### Schema와 호환
+
+| 대상 | schema | 비고 |
+| --- | --- | --- |
+| native page store | `aimo-native-page-v1` | tensor는 `weights_only=True`, sha256 확인 |
+| Stage-E checkpoint | `aimo-stage-e-v1` | legacy Looped(`aimo-checkpoint-v3`) / LRT(`aimo-lrt-v1`)와 서로 load 불가 |
+| 제출 artifact | `aimo-submission-artifact-v1` | JSON + tensor, model revision pin 필수 |
+| legacy Page | `aimo-page-store-v2` | 그대로 유지, native 경로에서는 `SCHEMA_INCOMPATIBLE` |
+
+`Config.hash()`는 `stage_e` section이 기본값이면 그 section을 빼고 계산한다. 이 section이
+생기기 전의 Looped / LRT / FP32 run config hash(resume guard)가 바뀌지 않는다.
+
 ## Current primary: Flow representation learning → frozen robustness probe
 
 현재 primary는 **E-FLOW-1**이다. 직전 FP32 behavior regression의 전체 81 valid pairs 중
